@@ -481,15 +481,18 @@ function M.generateRearEnd(seed)
   end
 
   generatedVehicles = {
-    {vehicle = carA, initialPosition = copyPosition(posA), initialRotation = rotation, label = 'Car A'},
-    {vehicle = carB, initialPosition = copyPosition(posB), initialRotation = rotation, label = 'Car B'},
+    {vehicle = carA, initialPosition = copyPosition(posA), initialRotation = rotation, model = generatedVehicleModels[1], label = 'Car A'},
+    {vehicle = carB, initialPosition = copyPosition(posB), initialRotation = rotation, model = generatedVehicleModels[2], label = 'Car B'},
   }
   generatedScene = {
+    seed = seed,
     spotIndex = spot.index,
     nodeA = spot.nodeA,
     nodeB = spot.nodeB,
     posA = copyPosition(posA),
     posB = copyPosition(posB),
+    rotation = rotation,
+    vehicleModels = {generatedVehicleModels[1], generatedVehicleModels[2]},
     dir = copyVector(dir),
     distanceBehind = distanceBehind,
     leadSpeedMps = leadSpeedMps,
@@ -532,6 +535,60 @@ function M.reset()
     log('I', logTag, string.format('Reset %s result=%s', entry.label, tostring(ok)))
   end
   return #generatedVehicles > 0
+end
+
+function M.repeatScene()
+  log('I', logTag, 'Repeat mode: respawn same scene')
+  if not generatedScene or #generatedVehicles == 0 then
+    log('W', logTag, 'Cannot repeat scene: no generated scene is available')
+    return false
+  end
+
+  local scene = generatedScene
+  local oldVehicleIds = {}
+  for _, entry in ipairs(generatedVehicles) do
+    local id = '?'
+    if entry.vehicle and entry.vehicle.getID then
+      pcall(function() id = entry.vehicle:getID() end)
+    end
+    table.insert(oldVehicleIds, string.format('%s=%s', entry.label, tostring(id)))
+  end
+  log('I', logTag, string.format('Old vehicle IDs cleared: %s', table.concat(oldVehicleIds, ', ')))
+
+  log('I', logTag, 'Repeat step 1/3: clearing old generated vehicles')
+  M.clearGeneratedVehicles()
+
+  log('I', logTag, string.format(
+    'Same spot/seed reused: spot=%s seed=%s nodes=%s->%s targetPath={%s}',
+    tostring(scene.spotIndex), tostring(scene.seed), tostring(scene.nodeA), tostring(scene.nodeB),
+    scene.targetPath and table.concat(scene.targetPath, ', ') or ''
+  ))
+  log('I', logTag, 'Repeat step 2/3: respawning vehicles at stored positions and rotations')
+
+  local modelA = scene.vehicleModels and scene.vehicleModels[1] or generatedVehicleModels[1]
+  local modelB = scene.vehicleModels and scene.vehicleModels[2] or generatedVehicleModels[2]
+  local rotation = scene.rotation
+  local carA = spawnVehicle(modelA, vec3(scene.posA.x, scene.posA.y, scene.posA.z), rotation, 'Car A')
+  local carB = spawnVehicle(modelB, vec3(scene.posB.x, scene.posB.y, scene.posB.z), rotation, 'Car B')
+  if not carA or not carB then
+    log('E', logTag, 'Repeat respawn failed; clearing partial result')
+    if carA then table.insert(generatedVehicles, {vehicle = carA, label = 'Car A'}) end
+    if carB then table.insert(generatedVehicles, {vehicle = carB, label = 'Car B'}) end
+    M.clearGeneratedVehicles()
+    return false
+  end
+
+  generatedVehicles = {
+    {vehicle = carA, initialPosition = copyPosition(scene.posA), initialRotation = rotation, model = modelA, label = 'Car A'},
+    {vehicle = carB, initialPosition = copyPosition(scene.posB), initialRotation = rotation, model = modelB, label = 'Car B'},
+  }
+  generatedScene = scene
+  log('I', logTag, string.format('New vehicle IDs spawned: Car A=%s, Car B=%s', vehicleLabel(carA, '?'), vehicleLabel(carB, '?')))
+
+  log('I', logTag, 'Repeat step 3/3: reapplying AI and starting the same scene')
+  local started = M.start()
+  log('I', logTag, string.format('AI reapplied; same scene repeat complete; started=%s', tostring(started)))
+  return started
 end
 
 function M.printGeneratedSceneDebug()
