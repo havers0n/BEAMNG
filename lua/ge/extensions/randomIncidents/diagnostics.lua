@@ -203,6 +203,11 @@ local function isWithinUserPath(path, base)
   return lowerPath == lowerBase or lowerPath:sub(1, #lowerBase + 1) == lowerBase .. '/'
 end
 
+local function isValidPhysicalPath(path, base)
+  path = normalizeFsPath(path)
+  return path ~= '' and path ~= normalizeFsPath(base) and not path:find('..', 1, true) and path:match('^%a:/') ~= nil and isWithinUserPath(path, base)
+end
+
 local function pathError(code, normalizedPath, baseUserPath, failedStep, message, virtualPath, physicalPath, createResult, existsAfter)
   return {ok=false, code=code, normalizedPath=normalizedPath, baseUserPath=baseUserPath, failedStep=failedStep, virtualPath=virtualPath, physicalPath=physicalPath, createResult=createResult, existsAfter=existsAfter, message=message}
 end
@@ -236,8 +241,8 @@ local function buildExportPaths(sessionId, report)
   local baseOk, baseResult = pcall(function() return FS and FS:getUserPath() end)
   if baseOk then rawBase = baseResult end
   local baseUserPath = normalizeFsPath(rawBase)
-  local virtualParentPath = '/random_incident_generator/'
-  local virtualLogsPath = '/random_incident_generator/logs/'
+  local virtualParentPath = 'random_incident_generator/'
+  local virtualLogsPath = 'random_incident_generator/logs/'
   local physicalParentPath = nil
   local physicalLogsPath = nil
   report = report or {}
@@ -251,10 +256,27 @@ local function buildExportPaths(sessionId, report)
 
   local physicalParentOk, physicalParentResult = pcall(function() return FS:expandFilename(virtualParentPath) end)
   local physicalLogsOk, physicalLogsResult = pcall(function() return FS:expandFilename(virtualLogsPath) end)
-  if physicalParentOk then physicalParentPath = normalizeFsPath(physicalParentResult) end
-  if physicalLogsOk then physicalLogsPath = normalizeFsPath(physicalLogsResult) end
-  if not physicalParentOk or not physicalLogsOk or physicalParentPath == '' or physicalLogsPath == '' then
-    return nil, pathError('PHYSICAL_PATH_UNAVAILABLE', physicalLogsPath or baseUserPath, baseUserPath, 'expand_physical_path', 'Unable to expand BeamNG virtual export path', virtualLogsPath, physicalLogsPath)
+  local expandedParentPath = physicalParentOk and normalizeFsPath(physicalParentResult) or ''
+  local expandedLogsPath = physicalLogsOk and normalizeFsPath(physicalLogsResult) or ''
+  report.expandedParentPath = expandedParentPath
+  report.expandedLogsPath = expandedLogsPath
+  report.expansionChangedParent = expandedParentPath ~= normalizeFsPath(virtualParentPath)
+  report.expansionChangedLogs = expandedLogsPath ~= normalizeFsPath(virtualLogsPath)
+  local physicalPathSource = 'expandFilename'
+  if isValidPhysicalPath(expandedParentPath, baseUserPath) and isValidPhysicalPath(expandedLogsPath, baseUserPath) then
+    physicalParentPath = expandedParentPath
+    physicalLogsPath = expandedLogsPath
+  else
+    physicalPathSource = 'safe_user_path_join'
+    physicalParentPath = joinFsPath(baseUserPath, 'random_incident_generator')
+    physicalLogsPath = joinFsPath(baseUserPath, 'random_incident_generator', 'logs')
+  end
+  report.physicalPathSource = physicalPathSource
+  if not isValidPhysicalPath(physicalParentPath, baseUserPath) or not isValidPhysicalPath(physicalLogsPath, baseUserPath) then
+    local errorResult = pathError('VFS_EXPANSION_FAILED', physicalLogsPath or baseUserPath, baseUserPath, 'resolve_physical_path', 'Unable to resolve a physical diagnostic path inside BeamNG user path', virtualLogsPath, physicalLogsPath)
+    errorResult.expandedPath = expandedLogsPath
+    errorResult.fallbackAttempted = true
+    return nil, errorResult
   end
   physicalParentPath = physicalParentPath .. '/'
   physicalLogsPath = physicalLogsPath .. '/'
@@ -265,14 +287,14 @@ local function buildExportPaths(sessionId, report)
   end
 
   local parentOk, parentError, parentInfo = ensureDirectory(virtualParentPath, physicalParentPath, baseUserPath, 'create_parent')
-  report.parentExistsBefore = parentInfo and parentInfo.existsBefore or false
-  report.parentCreateResult = parentInfo and parentInfo.createResult or 'not_called'
-  report.parentExistsAfter = parentInfo and parentInfo.existsAfter or false
+  report.virtualParentExistsBefore = parentInfo and parentInfo.existsBefore or false
+  report.virtualParentCreateResult = parentInfo and parentInfo.createResult or 'not_called'
+  report.virtualParentExistsAfter = parentInfo and parentInfo.existsAfter or false
   if not parentOk then return nil, parentError end
   local exportOk, exportError, logsInfo = ensureDirectory(virtualLogsPath, physicalLogsPath, baseUserPath, 'create_export_directory')
-  report.logsExistsBefore = logsInfo and logsInfo.existsBefore or false
-  report.logsCreateResult = logsInfo and logsInfo.createResult or 'not_called'
-  report.logsExistsAfter = logsInfo and logsInfo.existsAfter or false
+  report.virtualLogsExistsBefore = logsInfo and logsInfo.existsBefore or false
+  report.virtualLogsCreateResult = logsInfo and logsInfo.createResult or 'not_called'
+  report.virtualLogsExistsAfter = logsInfo and logsInfo.existsAfter or false
   if not exportOk then return nil, exportError end
   local probeVirtualPath = virtualLogsPath .. 'randomIncidents_export_probe.tmp'
   local probePhysicalPath = physicalLogsPath .. 'randomIncidents_export_probe.tmp'
@@ -314,6 +336,8 @@ function M.testDiagnosticExportPath()
     report.physicalPath = errorResult and errorResult.physicalPath or report.physicalLogsPath
     report.createResult = errorResult and errorResult.createResult or nil
     report.existsAfter = errorResult and errorResult.existsAfter or false
+    report.expandedPath = errorResult and errorResult.expandedPath or report.expandedLogsPath
+    report.fallbackAttempted = errorResult and errorResult.fallbackAttempted or false
     report.message = errorResult and errorResult.message or 'Unable to prepare diagnostic export path'
     return report
   end
