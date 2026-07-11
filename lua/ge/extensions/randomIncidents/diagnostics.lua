@@ -250,6 +250,8 @@ local function buildExportPaths(sessionId, report)
   report.normalizedUserPath = baseUserPath
   report.virtualParentPath = virtualParentPath
   report.virtualLogsPath = virtualLogsPath
+  report.writeBackend = 'sandboxed_io_open'
+  report.writePathType = 'virtual'
   pathProbe(string.format('Export path rawUserPath=%s normalizedUserPath=%s virtualParent=%s virtualLogs=%s', tostring(rawBase), baseUserPath, virtualParentPath, virtualLogsPath), {rawUserPath=rawBase, normalizedUserPath=baseUserPath, virtualParentPath=virtualParentPath, virtualLogsPath=virtualLogsPath})
   if not baseOk or baseUserPath == '' then return nil, pathError('USER_PATH_UNAVAILABLE', baseUserPath, baseUserPath, 'resolve_user_path', 'BeamNG user path is unavailable', virtualParentPath, nil) end
   if not FS or not FS.expandFilename or not FS.directoryExists or not FS.directoryCreate or not FS.fileExists or not FS.removeFile then return nil, pathError('FS_API_UNAVAILABLE', baseUserPath, baseUserPath, 'validate_fs_api', 'BeamNG filesystem API is unavailable', virtualParentPath, nil) end
@@ -298,26 +300,36 @@ local function buildExportPaths(sessionId, report)
   if not exportOk then return nil, exportError end
   local probeVirtualPath = virtualLogsPath .. 'randomIncidents_export_probe.tmp'
   local probePhysicalPath = physicalLogsPath .. 'randomIncidents_export_probe.tmp'
+  local virtualProbePath = '/' .. probeVirtualPath
   report.probeFilePath = probePhysicalPath
-  local probeFile = io.open(probePhysicalPath, 'w')
+  report.virtualProbePath = virtualProbePath
+  report.physicalProbeDisplayPath = probePhysicalPath
+  report.writeBackend = 'sandboxed_io_open'
+  report.writePathType = 'virtual'
+  local probeFile = io.open(virtualProbePath, 'w')
   report.probeOpenOk = probeFile ~= nil
   report.probeWriteOk = false
+  report.probeCloseOk = false
   if probeFile then
     local writeOk = pcall(function() probeFile:write('Random Incident Generator export probe\n') end)
     local closeOk = pcall(function() probeFile:close() end)
     report.probeWriteOk = writeOk and closeOk
+    report.probeCloseOk = closeOk
   end
-  local cleanupCallOk, cleanupResult = pcall(function() return FS:removeFile(probeVirtualPath) end)
-  local probeExistsAfter = false
-  local probeExistsCallOk, probeExistsResult = pcall(function() return FS:fileExists(probeVirtualPath) end)
-  if probeExistsCallOk then probeExistsAfter = probeExistsResult == true end
-  report.probeCleanupOk = cleanupCallOk and not probeExistsAfter and (cleanupResult == 0 or cleanupResult == true)
-  if not report.probeOpenOk then return nil, pathError('PROBE_OPEN_FAILED', physicalLogsPath, baseUserPath, 'probe_open', 'Unable to open diagnostic probe file', probeVirtualPath, probePhysicalPath, nil, false) end
-  if not report.probeWriteOk then return nil, pathError('PROBE_WRITE_FAILED', physicalLogsPath, baseUserPath, 'probe_write', 'Unable to write diagnostic probe file', probeVirtualPath, probePhysicalPath, nil, false) end
-  if not report.probeCleanupOk then return nil, pathError('PROBE_CLEANUP_FAILED', physicalLogsPath, baseUserPath, 'probe_cleanup', 'Unable to remove diagnostic probe file', probeVirtualPath, probePhysicalPath, cleanupResult, probeExistsAfter) end
+  local probeExistsWriteOk, probeExistsWriteResult = pcall(function() return FS:fileExists(virtualProbePath) end)
+  report.probeExistsAfterWrite = probeExistsWriteOk and probeExistsWriteResult == true
+  local cleanupCallOk, cleanupResult = pcall(function() return FS:removeFile(virtualProbePath) end)
+  local probeExistsAfterCleanup = false
+  local probeExistsCleanupOk, probeExistsCleanupResult = pcall(function() return FS:fileExists(virtualProbePath) end)
+  if probeExistsCleanupOk then probeExistsAfterCleanup = probeExistsCleanupResult == true end
+  report.probeCleanupOk = cleanupCallOk and not probeExistsAfterCleanup and (cleanupResult == 0 or cleanupResult == true)
+  if not report.probeOpenOk then return nil, pathError('PROBE_OPEN_FAILED', physicalLogsPath, baseUserPath, 'probe_open', 'Unable to open diagnostic probe file through BeamNG VFS', virtualProbePath, probePhysicalPath, nil, false) end
+  if not report.probeWriteOk then return nil, pathError('PROBE_WRITE_FAILED', physicalLogsPath, baseUserPath, 'probe_write', 'Unable to write diagnostic probe file through BeamNG VFS', virtualProbePath, probePhysicalPath, nil, false) end
+  if not report.probeCloseOk then return nil, pathError('PROBE_CLOSE_FAILED', physicalLogsPath, baseUserPath, 'probe_close', 'Unable to close diagnostic probe file', virtualProbePath, probePhysicalPath, nil, false) end
+  if not report.probeCleanupOk then return nil, pathError('PROBE_CLEANUP_FAILED', physicalLogsPath, baseUserPath, 'probe_cleanup', 'Unable to remove diagnostic probe file through BeamNG VFS', virtualProbePath, probePhysicalPath, cleanupResult, probeExistsAfterCleanup) end
   local safeSessionId = tostring(sessionId or ''):gsub('[^%w%-_]', '_')
-  local virtualTxtPath = virtualLogsPath .. 'randomIncidents_' .. safeSessionId .. '.txt'
-  local virtualJsonlPath = virtualLogsPath .. 'randomIncidents_' .. safeSessionId .. '.jsonl'
+  local virtualTxtPath = '/' .. virtualLogsPath .. 'randomIncidents_' .. safeSessionId .. '.txt'
+  local virtualJsonlPath = '/' .. virtualLogsPath .. 'randomIncidents_' .. safeSessionId .. '.jsonl'
   local physicalTxtPath = physicalLogsPath .. 'randomIncidents_' .. safeSessionId .. '.txt'
   local physicalJsonlPath = physicalLogsPath .. 'randomIncidents_' .. safeSessionId .. '.jsonl'
   return physicalTxtPath, physicalJsonlPath, virtualTxtPath, virtualJsonlPath
@@ -345,6 +357,16 @@ function M.testDiagnosticExportPath()
   return report
 end
 
+local function removeVirtualFile(path)
+  if not FS or not FS.removeFile then return false end
+  local ok, result = pcall(function() return FS:removeFile(path) end)
+  return ok and (result == 0 or result == true)
+end
+
+local function exportFailure(code, failedStep, virtualPath, physicalDisplayPath, message)
+  return {ok=false, code=code, failedStep=failedStep, writeBackend='sandboxed_io_open', writePathType='virtual', virtualPath=virtualPath, physicalDisplayPath=physicalDisplayPath, message=message}
+end
+
 local function textReport(session)
   local c = session.counters or {}
   local out = {'Random Incident Generator Diagnostic Session', '============================================', '1. Header', 'sessionId: ' .. tostring(session.sessionId), 'status: ' .. tostring(session.status), 'createdAt: ' .. tostring(session.createdAt), 'modVersion: ' .. tostring(session.modVersion), '', '2. Scenario', 'scenarioId: ' .. tostring(session.scenarioId), 'scenarioVersion: ' .. tostring(session.scenarioVersion), 'phase: ' .. tostring(session.phase), 'seed: ' .. tostring(session.seed), '', '3. Environment', 'map: ' .. tostring(session.mapName), 'sceneTime: ' .. tostring(session.sceneTime), '', '4. Actors'}
@@ -363,23 +385,48 @@ function M.exportLastSession()
   if not session then return {ok=false, code='NO_SESSION', message='No diagnostic session is available'} end
   local txtPath, jsonlPath, virtualTxtPath, virtualJsonlPath = buildExportPaths(session.sessionId)
   if not txtPath then return jsonlPath end
-  local txtTemp, jsonlTemp = txtPath .. '.tmp', jsonlPath .. '.tmp'
   local virtualTxtTemp, virtualJsonlTemp = virtualTxtPath .. '.tmp', virtualJsonlPath .. '.tmp'
-  local txt = io.open(txtTemp, 'w'); if not txt then return {ok=false, code='TXT_OPEN_FAILED', message='Unable to open TXT export'} end
-  txt:write(textReport(session)); txt:close()
-  local jsonl = io.open(jsonlTemp, 'w'); if not jsonl then if FS and FS.removeFile then FS:removeFile(virtualTxtTemp) end; return {ok=false, code='JSONL_OPEN_FAILED', message='Unable to open JSONL export'} end
+  local txt = io.open(virtualTxtTemp, 'w')
+  if not txt then return exportFailure('TXT_OPEN_FAILED', 'txt_open', virtualTxtTemp, txtPath, 'Unable to open TXT export through BeamNG VFS') end
+  local txtWriteOk = pcall(function() txt:write(textReport(session)) end)
+  local txtCloseOk = pcall(function() txt:close() end)
+  if not txtWriteOk then removeVirtualFile(virtualTxtTemp); return exportFailure('TXT_WRITE_FAILED', 'txt_write', virtualTxtTemp, txtPath, 'Unable to write TXT export through BeamNG VFS') end
+  if not txtCloseOk then removeVirtualFile(virtualTxtTemp); return exportFailure('TXT_CLOSE_FAILED', 'txt_close', virtualTxtTemp, txtPath, 'Unable to close TXT export') end
+  local txtExistsOk, txtExists = pcall(function() return FS:fileExists(virtualTxtTemp) end)
+  if not txtExistsOk or txtExists ~= true then removeVirtualFile(virtualTxtTemp); return exportFailure('TXT_VERIFY_FAILED', 'txt_verify_temp', virtualTxtTemp, txtPath, 'TXT temporary file was not visible through BeamNG VFS') end
+
+  local jsonl = io.open(virtualJsonlTemp, 'w')
+  if not jsonl then removeVirtualFile(virtualTxtTemp); return exportFailure('JSONL_OPEN_FAILED', 'jsonl_open', virtualJsonlTemp, jsonlPath, 'Unable to open JSONL export through BeamNG VFS') end
   local safe = copy(session, 0); safe.events = nil; safe._coalesced = nil; safe.recordType = 'session'
-  jsonl:write(jsonEncode(safe) .. '\n')
-  for _, event in ipairs(session.events or {}) do local eventRecord = copy(event, 0); eventRecord.recordType = 'event'; jsonl:write(jsonEncode(eventRecord) .. '\n') end
-  jsonl:write(jsonEncode({recordType='summary', sessionId=session.sessionId, counters=copy(session.counters or {}, 0), eventCount=#(session.events or {})}) .. '\n'); jsonl:close()
-  if not FS or not FS.renameFile or FS:renameFile(virtualTxtTemp, virtualTxtPath) ~= 0 then
-    if FS and FS.removeFile then FS:removeFile(virtualTxtTemp); FS:removeFile(virtualJsonlTemp) end
-    return {ok=false, code='TXT_COMMIT_FAILED', message='Unable to commit TXT export'}
+  local jsonlWriteOk = pcall(function()
+    jsonl:write(jsonEncode(safe) .. '\n')
+    for _, event in ipairs(session.events or {}) do local eventRecord = copy(event, 0); eventRecord.recordType = 'event'; jsonl:write(jsonEncode(eventRecord) .. '\n') end
+    jsonl:write(jsonEncode({recordType='summary', sessionId=session.sessionId, counters=copy(session.counters or {}, 0), eventCount=#(session.events or {})}) .. '\n')
+  end)
+  local jsonlCloseOk = pcall(function() jsonl:close() end)
+  if not jsonlWriteOk then removeVirtualFile(virtualTxtTemp); removeVirtualFile(virtualJsonlTemp); return exportFailure('JSONL_WRITE_FAILED', 'jsonl_write', virtualJsonlTemp, jsonlPath, 'Unable to write JSONL export through BeamNG VFS') end
+  if not jsonlCloseOk then removeVirtualFile(virtualTxtTemp); removeVirtualFile(virtualJsonlTemp); return exportFailure('JSONL_CLOSE_FAILED', 'jsonl_close', virtualJsonlTemp, jsonlPath, 'Unable to close JSONL export') end
+  local jsonlExistsOk, jsonlExists = pcall(function() return FS:fileExists(virtualJsonlTemp) end)
+  if not jsonlExistsOk or jsonlExists ~= true then removeVirtualFile(virtualTxtTemp); removeVirtualFile(virtualJsonlTemp); return exportFailure('JSONL_VERIFY_FAILED', 'jsonl_verify_temp', virtualJsonlTemp, jsonlPath, 'JSONL temporary file was not visible through BeamNG VFS') end
+
+  local txtRenameOk, txtRenameResult = false, nil
+  if FS and FS.renameFile then txtRenameOk, txtRenameResult = pcall(function() return FS:renameFile(virtualTxtTemp, virtualTxtPath) end) end
+  if not txtRenameOk or txtRenameResult ~= 0 then
+    removeVirtualFile(virtualTxtTemp); removeVirtualFile(virtualJsonlTemp)
+    return exportFailure('TXT_COMMIT_FAILED', 'txt_rename', virtualTxtTemp, txtPath, 'Unable to commit TXT export')
   end
-  if FS:renameFile(virtualJsonlTemp, virtualJsonlPath) ~= 0 then
-    if FS and FS.removeFile then FS:removeFile(virtualJsonlTemp); FS:removeFile(virtualTxtPath) end
-    return {ok=false, code='JSONL_COMMIT_FAILED', message='Unable to commit JSONL export'}
+  local txtFinalOk, txtFinalExists = pcall(function() return FS:fileExists(virtualTxtPath) end)
+  if not txtFinalOk or txtFinalExists ~= true then
+    removeVirtualFile(virtualJsonlTemp)
+    return exportFailure('TXT_VERIFY_FAILED', 'txt_verify_final', virtualTxtPath, txtPath, 'TXT final file was not visible through BeamNG VFS')
   end
+  local jsonlRenameOk, jsonlRenameResult = pcall(function() return FS:renameFile(virtualJsonlTemp, virtualJsonlPath) end)
+  if not jsonlRenameOk or jsonlRenameResult ~= 0 then
+    removeVirtualFile(virtualJsonlTemp)
+    return exportFailure('JSONL_COMMIT_FAILED', 'jsonl_rename', virtualJsonlTemp, jsonlPath, 'Unable to commit JSONL export')
+  end
+  local jsonlFinalOk, jsonlFinalExists = pcall(function() return FS:fileExists(virtualJsonlPath) end)
+  if not jsonlFinalOk or jsonlFinalExists ~= true then return exportFailure('JSONL_VERIFY_FAILED', 'jsonl_verify_final', virtualJsonlPath, jsonlPath, 'JSONL final file was not visible through BeamNG VFS') end
   session.export = {txtPath=txtPath, jsonlPath=jsonlPath, exportedAt=os.date('!%Y-%m-%dT%H:%M:%SZ')}
   return {ok=true, sessionId=session.sessionId, txtPath=txtPath, jsonlPath=jsonlPath, eventCount=#(session.events or {}), warningCount=session.counters.WARNCount or 0, errorCount=session.counters.ERRORCount or 0}
 end
