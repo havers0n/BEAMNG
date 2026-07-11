@@ -182,19 +182,25 @@ function M.getLastSessionReport()
   local result = copy(session, 0); result._coalesced = nil; return result
 end
 
-local function stripTrailingSeparators(path)
-  path = tostring(path or '')
-  if path:match('^%a:[\\/]$') then return path:sub(1, 2) .. '\\' end
-  return path:gsub('[/\\]+$', '')
+local function normalizeFsPath(path)
+  path = tostring(path or ''):gsub('\\', '/')
+  path = path:gsub('/+', '/')
+  if path:match('^%a:/$') then return path end
+  return path:gsub('/+$', '')
 end
 
-local function normalizeUserPath(path)
-  return stripTrailingSeparators(tostring(path or ''):gsub('/', '\\'))
+local function joinFsPath(base, ...)
+  local result = normalizeFsPath(base)
+  for _, segment in ipairs({...}) do
+    local cleanSegment = tostring(segment or ''):gsub('^/+', ''):gsub('/+$', '')
+    if cleanSegment ~= '' then result = result .. '/' .. cleanSegment end
+  end
+  return normalizeFsPath(result)
 end
 
 local function isWithinUserPath(path, base)
-  local lowerPath, lowerBase = string.lower(path), string.lower(base)
-  return lowerPath == lowerBase or lowerPath:sub(1, #lowerBase + 1) == lowerBase .. '\\'
+  local lowerPath, lowerBase = string.lower(normalizeFsPath(path)), string.lower(normalizeFsPath(base))
+  return lowerPath == lowerBase or lowerPath:sub(1, #lowerBase + 1) == lowerBase .. '/'
 end
 
 local function pathError(code, normalizedPath, baseUserPath, failedStep, message)
@@ -206,39 +212,70 @@ local function pathProbe(message, fields)
 end
 
 local function ensureDirectory(path, baseUserPath, failedStep)
+  local info = {path=path, existsBefore=false, createResult='not_called', existsAfter=false}
   local existsBefore = false
   local existsOk, existsResult = pcall(function() return FS:directoryExists(path) end)
   if existsOk then existsBefore = existsResult == true end
+  info.existsBefore = existsBefore
   pathProbe(string.format('Export path step=%s path=%s directoryExistsBefore=%s', failedStep, path, tostring(existsBefore)), {path=path, directoryExistsBefore=existsBefore, step=failedStep})
-  if existsBefore then return true end
+  if existsBefore then info.existsAfter = true; return true, nil, info end
 
   local createOk, createResult = pcall(function() return FS:directoryCreate(path, true) end)
+  info.createResult = createResult
   local existsAfterOk, existsAfterResult = pcall(function() return FS:directoryExists(path) end)
   local existsAfter = existsAfterOk and existsAfterResult == true
+  info.existsAfter = existsAfter
   pathProbe(string.format('Export path step=%s path=%s directoryCreateResult=%s directoryExistsAfter=%s', failedStep, path, tostring(createResult), tostring(existsAfter)), {path=path, directoryCreateResult=createResult, directoryExistsAfter=existsAfter, step=failedStep})
-  if existsAfter then return true end
+  if existsAfter then return true, nil, info end
   local reason = createOk and ('directoryCreate result=' .. tostring(createResult)) or ('directoryCreate exception=' .. tostring(createResult))
-  return false, pathError('DIRECTORY_CREATE_FAILED', path, baseUserPath, failedStep, 'Unable to create diagnostic directory: ' .. reason)
+  return false, pathError('DIRECTORY_CREATE_FAILED', path, baseUserPath, failedStep, 'Unable to create diagnostic directory: ' .. reason), info
 end
 
-local function buildExportPaths(sessionId)
+local function buildExportPaths(sessionId, report)
   local rawBase = nil
   local baseOk, baseResult = pcall(function() return FS and FS:getUserPath() end)
   if baseOk then rawBase = baseResult end
-  local baseUserPath = normalizeUserPath(rawBase)
-  local parentPath = baseUserPath ~= '' and (baseUserPath .. '\\random_incident_generator') or ''
-  local exportDirectory = parentPath ~= '' and (parentPath .. '\\logs') or ''
+  local baseUserPath = normalizeFsPath(rawBase)
+  local parentPath = baseUserPath ~= '' and joinFsPath(baseUserPath, 'random_incident_generator') .. '/' or ''
+  local exportDirectory = parentPath ~= '' and joinFsPath(parentPath, 'logs') .. '/' or ''
+  report = report or {}
+  report.rawUserPath = rawBase
+  report.normalizedUserPath = baseUserPath
+  report.parentPath = parentPath
+  report.logsPath = exportDirectory
   pathProbe(string.format('Export path rawUserPath=%s normalizedUserPath=%s exportDirectory=%s', tostring(rawBase), baseUserPath, exportDirectory), {rawUserPath=rawBase, normalizedUserPath=baseUserPath, exportDirectory=exportDirectory})
   if not baseOk or baseUserPath == '' then return nil, pathError('USER_PATH_UNAVAILABLE', exportDirectory, baseUserPath, 'resolve_user_path', 'BeamNG user path is unavailable') end
   if not isWithinUserPath(parentPath, baseUserPath) or not isWithinUserPath(exportDirectory, baseUserPath) then return nil, pathError('PATH_OUTSIDE_USER_PATH', exportDirectory, baseUserPath, 'validate_path', 'Diagnostic export path is outside BeamNG user path') end
   if not FS or not FS.directoryExists or not FS.directoryCreate then return nil, pathError('FS_API_UNAVAILABLE', exportDirectory, baseUserPath, 'validate_fs_api', 'BeamNG filesystem API is unavailable') end
 
-  local parentOk, parentError = ensureDirectory(parentPath, baseUserPath, 'create_parent')
+  local parentOk, parentError, parentInfo = ensureDirectory(parentPath, baseUserPath, 'create_parent')
+  report.parentExistsBefore = parentInfo and parentInfo.existsBefore or false
+  report.parentCreateResult = parentInfo and parentInfo.createResult or 'not_called'
+  report.parentExistsAfter = parentInfo and parentInfo.existsAfter or false
   if not parentOk then return nil, parentError end
-  local exportOk, exportError = ensureDirectory(exportDirectory, baseUserPath, 'create_export_directory')
+  local exportOk, exportError, logsInfo = ensureDirectory(exportDirectory, baseUserPath, 'create_export_directory')
+  report.logsExistsBefore = logsInfo and logsInfo.existsBefore or false
+  report.logsCreateResult = logsInfo and logsInfo.createResult or 'not_called'
+  report.logsExistsAfter = logsInfo and logsInfo.existsAfter or false
   if not exportOk then return nil, exportError end
   local safeSessionId = tostring(sessionId or ''):gsub('[^%w%-_]', '_')
-  return exportDirectory .. '\\randomIncidents_' .. safeSessionId .. '.txt', exportDirectory .. '\\randomIncidents_' .. safeSessionId .. '.jsonl'
+  return exportDirectory .. 'randomIncidents_' .. safeSessionId .. '.txt', exportDirectory .. 'randomIncidents_' .. safeSessionId .. '.jsonl'
+end
+
+function M.testDiagnosticExportPath()
+  local report = {}
+  local txtPath, errorResult = buildExportPaths('path_self_check', report)
+  if not txtPath then
+    report.ok = false
+    report.code = errorResult and errorResult.code or 'PATH_UNAVAILABLE'
+    report.normalizedPath = errorResult and errorResult.normalizedPath or report.logsPath
+    report.baseUserPath = errorResult and errorResult.baseUserPath or report.normalizedUserPath
+    report.failedStep = errorResult and errorResult.failedStep or 'unknown'
+    report.message = errorResult and errorResult.message or 'Unable to prepare diagnostic export path'
+    return report
+  end
+  report.ok = true
+  return report
 end
 
 local function textReport(session)

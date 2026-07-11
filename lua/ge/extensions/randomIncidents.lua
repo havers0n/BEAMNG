@@ -3351,6 +3351,7 @@ function M.exportLastSessionLog()
   if result.ok then log('I', logTag, 'Diagnostic session exported: ' .. tostring(result.txtPath)) else log('E', logTag, 'Diagnostic session export failed: ' .. tostring(result.message)) end
   return result
 end
+function M.testDiagnosticExportPath() return diagnostics.testDiagnosticExportPath() end
 function M.exportCurrentSessionLog() return diagnostics.exportLastSession() end
 function M.getLastSessionReport() return diagnostics.getLastSessionReport() end
 function M.printLastSessionSummary() return diagnostics.printSummary() end
