@@ -1,0 +1,11 @@
+# Runtime and diagnostics
+logs/
+current_mod/
+
+# Generated audit packages
+beamng_agent_audit_*/
+*.zip
+
+# Temporary files
+*.tmp
+*.bak
