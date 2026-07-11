@@ -33,17 +33,58 @@ local function objectFor(s, id)
   if be and be.getObjectByID then local ok, value = pcall(function() return be:getObjectByID(id) end); if ok then return value end end
   return nil
 end
-local function liveState(s, actor, telemetry)
-  local o = objectFor(s, actor.objectId)
-  if o then
-    local pos, vel = nil, nil
-    if o.getPosition then local ok, v = pcall(function() return o:getPosition() end); if ok then pos=vector(v,s) end end
-    if o.getVelocity then local ok, v = pcall(function() return o:getVelocity() end); if ok then vel=vector(v,s) end end
-    if pos or vel then return pos, vel, 'live_vehicle' end
+-- All getters are isolated so one transient BeamNG object failure never loses
+-- another current field. This reader never sends commands to Vehicle Lua.
+local function readLiveActorState(s, actorRecord)
+  s.liveStateReadCount = s.liveStateReadCount + 1
+  if s.liveStateReader then
+    local ok, state = pcall(s.liveStateReader, actorRecord)
+    if ok and type(state) == 'table' then
+      local position, velocity, forward = vector(state.position, s), vector(state.velocity, s), vector(state.forward, s)
+      if position or velocity then return {exists=state.exists ~= false,position=position,velocity=velocity,forward=forward,speedMps=length(velocity),source='live_vehicle'} end
+    end
+    s.liveStateReadFailureCount=s.liveStateReadFailureCount+1
+    return {exists=false,source='partial'}
   end
-  local latest = telemetry and telemetry.latestByActor and telemetry.latestByActor[actor.actor]
-  if latest then return vector(latest.position, s), vector(latest.velocity, s), 'runtime_telemetry' end
-  return nil, nil, 'partial'
+  local vehicle = objectFor(s, actorRecord.objectId)
+  if not vehicle then s.liveStateReadFailureCount=s.liveStateReadFailureCount+1; return {exists=false,source='partial'} end
+  local position, velocity, forward = nil, nil, nil
+  if vehicle.getPosition then local ok, value=pcall(function() return vehicle:getPosition() end); if ok then position=vector(value,s) end end
+  if vehicle.getVelocity then local ok, value=pcall(function() return vehicle:getVelocity() end); if ok then velocity=vector(value,s) end end
+  if vehicle.getDirectionVector then local ok, value=pcall(function() return vehicle:getDirectionVector() end); if ok then forward=vector(value,s) end end
+  if not position and not velocity then s.liveStateReadFailureCount=s.liveStateReadFailureCount+1 end
+  return {exists=true,position=position,velocity=velocity,forward=forward,speedMps=length(velocity),source=(position and velocity) and 'live_vehicle' or 'partial'}
+end
+local function resolveCollisionActorState(s, actorRecord, telemetryAccessor)
+  local live = readLiveActorState(s, actorRecord)
+  local latest = telemetryAccessor and telemetryAccessor.latestByActor and telemetryAccessor.latestByActor[actorRecord.actor]
+  -- Do not use a stale actor record when a repeat has assigned a new object ID.
+  if latest and tonumber(latest.objectId) ~= tonumber(actorRecord.objectId) then latest=nil end
+  local position, velocity, forward = live.position, live.velocity, live.forward
+  local usedFallback = false
+  if latest then
+    if not position then position=vector(latest.position,s); usedFallback=position ~= nil end
+    if not velocity then velocity=vector(latest.velocity,s); usedFallback=velocity ~= nil end
+    if not forward then forward=vector(latest.forward,s) end
+  end
+  local source
+  if live.position and live.velocity then source='live_vehicle'
+  elseif not live.position and not live.velocity and position and velocity then source='runtime_telemetry'
+  else source='partial' end
+  if usedFallback then s.telemetryFallbackCount=s.telemetryFallbackCount+1 end
+  if source == 'partial' then s.partialStateCount=s.partialStateCount+1 end
+  return {exists=live.exists,position=position,velocity=velocity,forward=forward,speedMps=length(velocity),source=source}
+end
+local function computePairKinematics(stateA, stateB)
+  local velocityA, velocityB = stateA and stateA.velocity, stateB and stateB.velocity
+  if not velocityA or not velocityB then return nil, nil end
+  local relativeVelocity={x=velocityA.x-velocityB.x,y=velocityA.y-velocityB.y,z=velocityA.z-velocityB.z}
+  local relativeSpeed=length(relativeVelocity)
+  local positionA, positionB = stateA.position, stateB.position
+  if not positionA or not positionB then return relativeSpeed, nil end
+  local deltaPosition={x=positionB.x-positionA.x,y=positionB.y-positionA.y,z=positionB.z-positionA.z}; local distance=length(deltaPosition)
+  if not distance or distance <= 1e-6 then return relativeSpeed, nil end
+  return relativeSpeed, math.max(0,(relativeVelocity.x*deltaPosition.x+relativeVelocity.y*deltaPosition.y+relativeVelocity.z*deltaPosition.z)/distance)
 end
 local function normalizePair(s, a, b)
   a, b = tonumber(a), tonumber(b)
@@ -99,26 +140,22 @@ local function observe(s, pairKey, a, b, now, telemetry)
   local e = s.byPair[pairKey]
   if e and e.state == 'ENDED' and now - (e.endedAtSceneTime or now) > RECONTACT_MERGE_WINDOW then e=nil; s.byPair[pairKey]=nil end
   if e and e.state == 'ENDED' then e.state='ACTIVE'; e.endedAtSceneTime=nil end
-  local pa, va, sourceA = liveState(s,a,telemetry); local pb, vb, sourceB = liveState(s,b,telemetry)
-  local relative, closing = nil, nil
-  if va and vb then relative=length({x=va.x-vb.x,y=va.y-vb.y,z=va.z-vb.z}) end
-  if pa and pb and va and vb then
-    local normal={x=pb.x-pa.x,y=pb.y-pa.y,z=pb.z-pa.z}; local d=length(normal)
-    if d and d > 0 then closing=math.max(0, ((va.x-vb.x)*normal.x+(va.y-vb.y)*normal.y+(va.z-vb.z)*normal.z)/d) end
-  end
-  local stateSource = sourceA == 'live_vehicle' and sourceB == 'live_vehicle' and 'live_vehicle' or ((sourceA == 'runtime_telemetry' or sourceB == 'runtime_telemetry') and 'runtime_telemetry' or 'partial')
+  local stateA, stateB = resolveCollisionActorState(s,a,telemetry), resolveCollisionActorState(s,b,telemetry)
+  local relative, closing = computePairKinematics(stateA, stateB)
+  local stateSource = stateA.source == stateB.source and stateA.source or 'mixed'
   if not e then
     s.nextEventId=s.nextEventId+1
-    e={eventId='collision_'..s.sessionId..'_'..s.nextEventId, sessionId=s.sessionId, state='ACTIVE', pairKey=pairKey,
+    e={formatVersion=2,eventId='collision_'..s.sessionId..'_'..s.nextEventId, sessionId=s.sessionId, state='ACTIVE', pairKey=pairKey,
       actorA=a.actor,actorB=b.actor,objectIdA=a.objectId,objectIdB=b.objectId,roleA=a.role,roleB=b.role,ambientA=a.ambient,ambientB=b.ambient,
       startedAtSceneTime=now,lastObservedAtSceneTime=now,endedAtSceneTime=nil,durationSeconds=0,observationCount=0,sources={objectCollisions=true,crashDetection=false},
-      firstPositionA=pa,firstPositionB=pb,latestPositionA=pa,latestPositionB=pb,firstSpeedAMps=length(va),firstSpeedBMps=length(vb),latestSpeedAMps=length(va),latestSpeedBMps=length(vb),
+      firstPositionA=stateA.position,firstPositionB=stateB.position,latestPositionA=stateA.position,latestPositionB=stateB.position,firstSpeedAMps=stateA.speedMps,firstSpeedBMps=stateB.speedMps,latestSpeedAMps=stateA.speedMps,latestSpeedBMps=stateB.speedMps,
       firstRelativeSpeedMps=relative,maxRelativeSpeedMps=relative,firstClosingSpeedMps=closing,maxClosingSpeedMps=closing,stateSource=stateSource,
+      firstStateSourceA=stateA.source,firstStateSourceB=stateB.source,latestStateSourceA=stateA.source,latestStateSourceB=stateB.source,
       controllerStateA=s.controllerStateProvider and s.controllerStateProvider(a.actor,a.objectId) or nil,controllerStateB=s.controllerStateProvider and s.controllerStateProvider(b.actor,b.objectId) or nil}
     addEvent(s,e); s.byPair[pairKey]=e
     emit(s,'INFO','collision_started','Collision episode started',{eventId=e.eventId,pairKey=pairKey,actorA=a.actor,actorB=b.actor})
   else
-    e.lastObservedAtSceneTime=now; e.latestPositionA=pa or e.latestPositionA; e.latestPositionB=pb or e.latestPositionB; e.latestSpeedAMps=length(va) or e.latestSpeedAMps; e.latestSpeedBMps=length(vb) or e.latestSpeedBMps; e.stateSource=stateSource
+    e.lastObservedAtSceneTime=now; e.latestPositionA=stateA.position or e.latestPositionA; e.latestPositionB=stateB.position or e.latestPositionB; e.latestSpeedAMps=stateA.speedMps or e.latestSpeedAMps; e.latestSpeedBMps=stateB.speedMps or e.latestSpeedBMps; e.latestStateSourceA=stateA.source; e.latestStateSourceB=stateB.source
     if relative then e.maxRelativeSpeedMps=math.max(e.maxRelativeSpeedMps or relative,relative) end
     if closing then e.maxClosingSpeedMps=math.max(e.maxClosingSpeedMps or closing,closing) end
   end
@@ -146,12 +183,12 @@ local function snapshot(s)
   if not s then return nil end
   local events=copy(s.events); local active,ended=0,0; for _,e in ipairs(events) do if e.state=='ACTIVE' then active=active+1 else ended=ended+1 end end
   return {sessionId=s.sessionId,scenarioId=s.scenarioId,seed=s.seed,status=s.status,startedAtSceneTime=s.startedAtSceneTime,stoppedAtSceneTime=s.stoppedAtSceneTime,pollInterval=s.pollInterval,actorCount=#s.actors,
-    collisionEventCount=#events,activeCollisionCount=active,endedCollisionCount=ended,rawObservationCount=s.rawObservationCount,duplicateObservationCount=s.duplicateObservationCount,ignoredUnknownObjectCount=s.ignoredUnknownObjectCount,unpairedCrashSignalCount=s.unpairedCrashSignalCount,droppedCollisionEventCount=s.droppedCollisionEventCount,invalidFieldCount=s.invalidFieldCount,sourceStatus=copy(s.sourceStatus),events=events}
+    collisionEventCount=#events,activeCollisionCount=active,endedCollisionCount=ended,rawObservationCount=s.rawObservationCount,duplicateObservationCount=s.duplicateObservationCount,ignoredUnknownObjectCount=s.ignoredUnknownObjectCount,unpairedCrashSignalCount=s.unpairedCrashSignalCount,droppedCollisionEventCount=s.droppedCollisionEventCount,invalidFieldCount=s.invalidFieldCount,liveStateReadCount=s.liveStateReadCount,liveStateReadFailureCount=s.liveStateReadFailureCount,telemetryFallbackCount=s.telemetryFallbackCount,partialStateCount=s.partialStateCount,sourceStatus=copy(s.sourceStatus),events=events}
 end
 function M.startSession(config)
   if current then M.stopSession('replaced') end; config=type(config)=='table' and config or {}
   local actors, byId={},{}; for _,x in ipairs(config.actors or {}) do local id=tonumber(x.objectId); if id and not byId[id] then local a={actor=tostring(x.actor or x.label or ''),objectId=id,role=tostring(x.role or ''),ambient=x.ambient==true}; actors[#actors+1]=a;byId[id]=a end end
-  current={sessionId=tostring(config.sessionId or ''),scenarioId=config.scenarioId,seed=config.seed,status='ACTIVE',startedAtSceneTime=0,stoppedAtSceneTime=nil,sceneTime=0,pollInterval=finite(config.pollInterval) and config.pollInterval>0 and config.pollInterval or DEFAULT_POLL_INTERVAL,frameLevel=config.frameLevel==true,accumulator=0,actors=actors,actorsByObjectId=byId,events={},byPair={},nextEventId=0,rawObservationCount=0,duplicateObservationCount=0,ignoredUnknownObjectCount=0,unpairedCrashSignalCount=0,droppedCollisionEventCount=0,invalidFieldCount=0,diagnostics=config.diagnostics,objectProvider=config.objectProvider,controllerStateProvider=config.controllerStateProvider,sourceAdapter=config.sourceAdapter,sourceStatus={objectCollisionsAvailable=nil,crashDetectionAvailable=false,primarySource='objectCollisions'}}
+  current={sessionId=tostring(config.sessionId or ''),scenarioId=config.scenarioId,seed=config.seed,status='ACTIVE',startedAtSceneTime=0,stoppedAtSceneTime=nil,sceneTime=0,pollInterval=finite(config.pollInterval) and config.pollInterval>0 and config.pollInterval or DEFAULT_POLL_INTERVAL,frameLevel=config.frameLevel==true,accumulator=0,actors=actors,actorsByObjectId=byId,events={},byPair={},nextEventId=0,rawObservationCount=0,duplicateObservationCount=0,ignoredUnknownObjectCount=0,unpairedCrashSignalCount=0,droppedCollisionEventCount=0,invalidFieldCount=0,liveStateReadCount=0,liveStateReadFailureCount=0,telemetryFallbackCount=0,partialStateCount=0,diagnostics=config.diagnostics,objectProvider=config.objectProvider,liveStateReader=config.liveStateReader,controllerStateProvider=config.controllerStateProvider,sourceAdapter=config.sourceAdapter,sourceStatus={objectCollisionsAvailable=nil,crashDetectionAvailable=false,primarySource='objectCollisions'}}
   emit(current,'INFO','collision_observer_started','Collision observer started',{sessionId=current.sessionId,actorCount=#actors,pollInterval=current.pollInterval}); return current.sessionId
 end
 function M.update(dtSim, telemetry)
