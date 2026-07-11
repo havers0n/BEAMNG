@@ -180,9 +180,20 @@ function M.recordTrigger() if current then current.counters.triggerCount = (curr
 function M.finish(status) if current then archive(status or current.status) end end
 
 local function getSession() return current or lastSession end
+function M.getSessionSnapshot(session)
+  if type(session) ~= 'table' then return nil end
+  local snapshot = copy(session, 0)
+  snapshot.events = copy(session.events or {}, 0)
+  snapshot.actors = copy(session.actors or {}, 0)
+  snapshot.lastVehicleCommands = copy(session.lastVehicleCommands or {}, 0)
+  snapshot.counters = copy(session.counters or {}, 0)
+  snapshot._coalesced = copy(session._coalesced or {}, 0)
+  snapshot.export = copy(session.export or {}, 0)
+  return snapshot
+end
 function M.getLastSessionReport()
   local session = getSession(); if not session then return nil end
-  local result = copy(session, 0); result._coalesced = nil; return result
+  local result = M.getSessionSnapshot(session); result._coalesced = nil; return result
 end
 
 local function normalizeFsPath(path)
@@ -465,21 +476,23 @@ local function textReport(session, exportMetadata)
     table.insert(exportLines, 'writeBackend=' .. tostring(exportMetadata.writeBackend))
     table.insert(exportLines, 'sessionId=' .. tostring(exportMetadata.sessionId))
     table.insert(exportLines, 'formatVersion=' .. tostring(exportMetadata.formatVersion))
+    table.insert(exportLines, 'exportCount=' .. tostring(exportMetadata.exportCount or 1))
   end
   appendSection(out, '12. Export Metadata', exportLines)
   return table.concat(out, '\n') .. '\n'
 end
 
 function M.exportLastSession()
-  local session = lastSession or current
-  if not session then return {ok=false, code='NO_SESSION', message='No diagnostic session is available'} end
-  local txtPath, jsonlPath, virtualTxtPath, virtualJsonlPath = buildExportPaths(session.sessionId)
+  local liveSession = lastSession or current
+  if not liveSession then return {ok=false, code='NO_SESSION', message='No diagnostic session is available'} end
+  local snapshot = M.getSessionSnapshot(liveSession)
+  local txtPath, jsonlPath, virtualTxtPath, virtualJsonlPath = buildExportPaths(snapshot.sessionId)
   if not txtPath then return jsonlPath end
   local virtualTxtTemp, virtualJsonlTemp = virtualTxtPath .. '.tmp', virtualJsonlPath .. '.tmp'
-  local exportMetadata = {exportedAt=os.date('!%Y-%m-%dT%H:%M:%SZ'), txtPath=txtPath, jsonlPath=jsonlPath, writeBackend='sandboxed_io_open', sessionId=session.sessionId, formatVersion='1'}
+  local exportMetadata = {exportedAt=os.date('!%Y-%m-%dT%H:%M:%SZ'), txtPath=txtPath, jsonlPath=jsonlPath, writeBackend='sandboxed_io_open', sessionId=snapshot.sessionId, formatVersion='1', exportCount=((liveSession.export and liveSession.export.exportCount) or 0) + 1}
   local txt = io.open(virtualTxtTemp, 'w')
   if not txt then return exportFailure('TXT_OPEN_FAILED', 'txt_open', virtualTxtTemp, txtPath, 'Unable to open TXT export through BeamNG VFS') end
-  local txtWriteOk = pcall(function() txt:write(textReport(session, exportMetadata)) end)
+  local txtWriteOk = pcall(function() txt:write(textReport(snapshot, exportMetadata)) end)
   local txtCloseOk = pcall(function() txt:close() end)
   if not txtWriteOk then removeVirtualFile(virtualTxtTemp); return exportFailure('TXT_WRITE_FAILED', 'txt_write', virtualTxtTemp, txtPath, 'Unable to write TXT export through BeamNG VFS') end
   if not txtCloseOk then removeVirtualFile(virtualTxtTemp); return exportFailure('TXT_CLOSE_FAILED', 'txt_close', virtualTxtTemp, txtPath, 'Unable to close TXT export') end
@@ -488,11 +501,11 @@ function M.exportLastSession()
 
   local jsonl = io.open(virtualJsonlTemp, 'w')
   if not jsonl then removeVirtualFile(virtualTxtTemp); return exportFailure('JSONL_OPEN_FAILED', 'jsonl_open', virtualJsonlTemp, jsonlPath, 'Unable to open JSONL export through BeamNG VFS') end
-  local safe = copy(session, 0); safe.events = nil; safe._coalesced = nil; safe.recordType = 'session'
+  local safe = copy(snapshot, 0); safe.events = nil; safe._coalesced = nil; safe.recordType = 'session'
   local jsonlWriteOk = pcall(function()
     jsonl:write(jsonEncode(safe) .. '\n')
-    for _, event in ipairs(session.events or {}) do local eventRecord = copy(event, 0); eventRecord.recordType = 'event'; jsonl:write(jsonEncode(eventRecord) .. '\n') end
-    jsonl:write(jsonEncode({recordType='summary', sessionId=session.sessionId, counters=copy(session.counters or {}, 0), eventCount=#(session.events or {})}) .. '\n')
+    for _, event in ipairs(snapshot.events or {}) do local eventRecord = copy(event, 0); eventRecord.recordType = 'event'; jsonl:write(jsonEncode(eventRecord) .. '\n') end
+    jsonl:write(jsonEncode({recordType='summary', sessionId=snapshot.sessionId, counters=copy(snapshot.counters or {}, 0), eventCount=#(snapshot.events or {})}) .. '\n')
   end)
   local jsonlCloseOk = pcall(function() jsonl:close() end)
   if not jsonlWriteOk then removeVirtualFile(virtualTxtTemp); removeVirtualFile(virtualJsonlTemp); return exportFailure('JSONL_WRITE_FAILED', 'jsonl_write', virtualJsonlTemp, jsonlPath, 'Unable to write JSONL export through BeamNG VFS') end
@@ -518,8 +531,8 @@ function M.exportLastSession()
   end
   local jsonlFinalOk, jsonlFinalExists = pcall(function() return FS:fileExists(virtualJsonlPath) end)
   if not jsonlFinalOk or jsonlFinalExists ~= true then return exportFailure('JSONL_VERIFY_FAILED', 'jsonl_verify_final', virtualJsonlPath, jsonlPath, 'JSONL final file was not visible through BeamNG VFS') end
-  session.export = exportMetadata
-  return {ok=true, sessionId=session.sessionId, txtPath=txtPath, jsonlPath=jsonlPath, eventCount=#(session.events or {}), warningCount=session.counters.WARNCount or 0, errorCount=session.counters.ERRORCount or 0}
+  liveSession.export = copy(exportMetadata, 0)
+  return {ok=true, sessionId=snapshot.sessionId, txtPath=txtPath, jsonlPath=jsonlPath, eventCount=#(snapshot.events or {}), warningCount=snapshot.counters.WARNCount or 0, errorCount=snapshot.counters.ERRORCount or 0}
 end
 
 function M.printSummary()
