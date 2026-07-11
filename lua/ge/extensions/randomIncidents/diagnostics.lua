@@ -203,32 +203,32 @@ local function isWithinUserPath(path, base)
   return lowerPath == lowerBase or lowerPath:sub(1, #lowerBase + 1) == lowerBase .. '/'
 end
 
-local function pathError(code, normalizedPath, baseUserPath, failedStep, message)
-  return {ok=false, code=code, normalizedPath=normalizedPath, baseUserPath=baseUserPath, failedStep=failedStep, message=message}
+local function pathError(code, normalizedPath, baseUserPath, failedStep, message, virtualPath, physicalPath, createResult, existsAfter)
+  return {ok=false, code=code, normalizedPath=normalizedPath, baseUserPath=baseUserPath, failedStep=failedStep, virtualPath=virtualPath, physicalPath=physicalPath, createResult=createResult, existsAfter=existsAfter, message=message}
 end
 
 local function pathProbe(message, fields)
   M.log('DEBUG', 'export', 'export_path_probe', message, fields)
 end
 
-local function ensureDirectory(path, baseUserPath, failedStep)
-  local info = {path=path, existsBefore=false, createResult='not_called', existsAfter=false}
+local function ensureDirectory(virtualPath, physicalPath, baseUserPath, failedStep)
+  local info = {virtualPath=virtualPath, physicalPath=physicalPath, existsBefore=false, createResult='not_called', existsAfter=false}
   local existsBefore = false
-  local existsOk, existsResult = pcall(function() return FS:directoryExists(path) end)
+  local existsOk, existsResult = pcall(function() return FS:directoryExists(virtualPath) end)
   if existsOk then existsBefore = existsResult == true end
   info.existsBefore = existsBefore
-  pathProbe(string.format('Export path step=%s path=%s directoryExistsBefore=%s', failedStep, path, tostring(existsBefore)), {path=path, directoryExistsBefore=existsBefore, step=failedStep})
+  pathProbe(string.format('Export path step=%s virtual=%s physical=%s directoryExistsBefore=%s', failedStep, virtualPath, physicalPath, tostring(existsBefore)), {virtualPath=virtualPath, physicalPath=physicalPath, directoryExistsBefore=existsBefore, step=failedStep})
   if existsBefore then info.existsAfter = true; return true, nil, info end
 
-  local createOk, createResult = pcall(function() return FS:directoryCreate(path, true) end)
+  local createOk, createResult = pcall(function() return FS:directoryCreate(virtualPath, true) end)
   info.createResult = createResult
-  local existsAfterOk, existsAfterResult = pcall(function() return FS:directoryExists(path) end)
+  local existsAfterOk, existsAfterResult = pcall(function() return FS:directoryExists(virtualPath) end)
   local existsAfter = existsAfterOk and existsAfterResult == true
   info.existsAfter = existsAfter
-  pathProbe(string.format('Export path step=%s path=%s directoryCreateResult=%s directoryExistsAfter=%s', failedStep, path, tostring(createResult), tostring(existsAfter)), {path=path, directoryCreateResult=createResult, directoryExistsAfter=existsAfter, step=failedStep})
+  pathProbe(string.format('Export path step=%s virtual=%s physical=%s directoryCreateResult=%s directoryExistsAfter=%s', failedStep, virtualPath, physicalPath, tostring(createResult), tostring(existsAfter)), {virtualPath=virtualPath, physicalPath=physicalPath, directoryCreateResult=createResult, directoryExistsAfter=existsAfter, step=failedStep})
   if existsAfter then return true, nil, info end
   local reason = createOk and ('directoryCreate result=' .. tostring(createResult)) or ('directoryCreate exception=' .. tostring(createResult))
-  return false, pathError('DIRECTORY_CREATE_FAILED', path, baseUserPath, failedStep, 'Unable to create diagnostic directory: ' .. reason), info
+  return false, pathError('DIRECTORY_CREATE_FAILED', physicalPath, baseUserPath, failedStep, 'Unable to create diagnostic directory: ' .. reason, virtualPath, physicalPath, createResult, existsAfter), info
 end
 
 local function buildExportPaths(sessionId, report)
@@ -236,30 +236,69 @@ local function buildExportPaths(sessionId, report)
   local baseOk, baseResult = pcall(function() return FS and FS:getUserPath() end)
   if baseOk then rawBase = baseResult end
   local baseUserPath = normalizeFsPath(rawBase)
-  local parentPath = baseUserPath ~= '' and joinFsPath(baseUserPath, 'random_incident_generator') .. '/' or ''
-  local exportDirectory = parentPath ~= '' and joinFsPath(parentPath, 'logs') .. '/' or ''
+  local virtualParentPath = '/random_incident_generator/'
+  local virtualLogsPath = '/random_incident_generator/logs/'
+  local physicalParentPath = nil
+  local physicalLogsPath = nil
   report = report or {}
   report.rawUserPath = rawBase
   report.normalizedUserPath = baseUserPath
-  report.parentPath = parentPath
-  report.logsPath = exportDirectory
-  pathProbe(string.format('Export path rawUserPath=%s normalizedUserPath=%s exportDirectory=%s', tostring(rawBase), baseUserPath, exportDirectory), {rawUserPath=rawBase, normalizedUserPath=baseUserPath, exportDirectory=exportDirectory})
-  if not baseOk or baseUserPath == '' then return nil, pathError('USER_PATH_UNAVAILABLE', exportDirectory, baseUserPath, 'resolve_user_path', 'BeamNG user path is unavailable') end
-  if not isWithinUserPath(parentPath, baseUserPath) or not isWithinUserPath(exportDirectory, baseUserPath) then return nil, pathError('PATH_OUTSIDE_USER_PATH', exportDirectory, baseUserPath, 'validate_path', 'Diagnostic export path is outside BeamNG user path') end
-  if not FS or not FS.directoryExists or not FS.directoryCreate then return nil, pathError('FS_API_UNAVAILABLE', exportDirectory, baseUserPath, 'validate_fs_api', 'BeamNG filesystem API is unavailable') end
+  report.virtualParentPath = virtualParentPath
+  report.virtualLogsPath = virtualLogsPath
+  pathProbe(string.format('Export path rawUserPath=%s normalizedUserPath=%s virtualParent=%s virtualLogs=%s', tostring(rawBase), baseUserPath, virtualParentPath, virtualLogsPath), {rawUserPath=rawBase, normalizedUserPath=baseUserPath, virtualParentPath=virtualParentPath, virtualLogsPath=virtualLogsPath})
+  if not baseOk or baseUserPath == '' then return nil, pathError('USER_PATH_UNAVAILABLE', baseUserPath, baseUserPath, 'resolve_user_path', 'BeamNG user path is unavailable', virtualParentPath, nil) end
+  if not FS or not FS.expandFilename or not FS.directoryExists or not FS.directoryCreate or not FS.fileExists or not FS.removeFile then return nil, pathError('FS_API_UNAVAILABLE', baseUserPath, baseUserPath, 'validate_fs_api', 'BeamNG filesystem API is unavailable', virtualParentPath, nil) end
 
-  local parentOk, parentError, parentInfo = ensureDirectory(parentPath, baseUserPath, 'create_parent')
+  local physicalParentOk, physicalParentResult = pcall(function() return FS:expandFilename(virtualParentPath) end)
+  local physicalLogsOk, physicalLogsResult = pcall(function() return FS:expandFilename(virtualLogsPath) end)
+  if physicalParentOk then physicalParentPath = normalizeFsPath(physicalParentResult) end
+  if physicalLogsOk then physicalLogsPath = normalizeFsPath(physicalLogsResult) end
+  if not physicalParentOk or not physicalLogsOk or physicalParentPath == '' or physicalLogsPath == '' then
+    return nil, pathError('PHYSICAL_PATH_UNAVAILABLE', physicalLogsPath or baseUserPath, baseUserPath, 'expand_physical_path', 'Unable to expand BeamNG virtual export path', virtualLogsPath, physicalLogsPath)
+  end
+  physicalParentPath = physicalParentPath .. '/'
+  physicalLogsPath = physicalLogsPath .. '/'
+  report.physicalParentPath = physicalParentPath
+  report.physicalLogsPath = physicalLogsPath
+  if not isWithinUserPath(physicalParentPath, baseUserPath) or not isWithinUserPath(physicalLogsPath, baseUserPath) then
+    return nil, pathError('PATH_OUTSIDE_USER_PATH', physicalLogsPath, baseUserPath, 'validate_physical_path', 'Diagnostic export path is outside BeamNG user path', virtualLogsPath, physicalLogsPath)
+  end
+
+  local parentOk, parentError, parentInfo = ensureDirectory(virtualParentPath, physicalParentPath, baseUserPath, 'create_parent')
   report.parentExistsBefore = parentInfo and parentInfo.existsBefore or false
   report.parentCreateResult = parentInfo and parentInfo.createResult or 'not_called'
   report.parentExistsAfter = parentInfo and parentInfo.existsAfter or false
   if not parentOk then return nil, parentError end
-  local exportOk, exportError, logsInfo = ensureDirectory(exportDirectory, baseUserPath, 'create_export_directory')
+  local exportOk, exportError, logsInfo = ensureDirectory(virtualLogsPath, physicalLogsPath, baseUserPath, 'create_export_directory')
   report.logsExistsBefore = logsInfo and logsInfo.existsBefore or false
   report.logsCreateResult = logsInfo and logsInfo.createResult or 'not_called'
   report.logsExistsAfter = logsInfo and logsInfo.existsAfter or false
   if not exportOk then return nil, exportError end
+  local probeVirtualPath = virtualLogsPath .. 'randomIncidents_export_probe.tmp'
+  local probePhysicalPath = physicalLogsPath .. 'randomIncidents_export_probe.tmp'
+  report.probeFilePath = probePhysicalPath
+  local probeFile = io.open(probePhysicalPath, 'w')
+  report.probeOpenOk = probeFile ~= nil
+  report.probeWriteOk = false
+  if probeFile then
+    local writeOk = pcall(function() probeFile:write('Random Incident Generator export probe\n') end)
+    local closeOk = pcall(function() probeFile:close() end)
+    report.probeWriteOk = writeOk and closeOk
+  end
+  local cleanupCallOk, cleanupResult = pcall(function() return FS:removeFile(probeVirtualPath) end)
+  local probeExistsAfter = false
+  local probeExistsCallOk, probeExistsResult = pcall(function() return FS:fileExists(probeVirtualPath) end)
+  if probeExistsCallOk then probeExistsAfter = probeExistsResult == true end
+  report.probeCleanupOk = cleanupCallOk and not probeExistsAfter and (cleanupResult == 0 or cleanupResult == true)
+  if not report.probeOpenOk then return nil, pathError('PROBE_OPEN_FAILED', physicalLogsPath, baseUserPath, 'probe_open', 'Unable to open diagnostic probe file', probeVirtualPath, probePhysicalPath, nil, false) end
+  if not report.probeWriteOk then return nil, pathError('PROBE_WRITE_FAILED', physicalLogsPath, baseUserPath, 'probe_write', 'Unable to write diagnostic probe file', probeVirtualPath, probePhysicalPath, nil, false) end
+  if not report.probeCleanupOk then return nil, pathError('PROBE_CLEANUP_FAILED', physicalLogsPath, baseUserPath, 'probe_cleanup', 'Unable to remove diagnostic probe file', probeVirtualPath, probePhysicalPath, cleanupResult, probeExistsAfter) end
   local safeSessionId = tostring(sessionId or ''):gsub('[^%w%-_]', '_')
-  return exportDirectory .. 'randomIncidents_' .. safeSessionId .. '.txt', exportDirectory .. 'randomIncidents_' .. safeSessionId .. '.jsonl'
+  local virtualTxtPath = virtualLogsPath .. 'randomIncidents_' .. safeSessionId .. '.txt'
+  local virtualJsonlPath = virtualLogsPath .. 'randomIncidents_' .. safeSessionId .. '.jsonl'
+  local physicalTxtPath = physicalLogsPath .. 'randomIncidents_' .. safeSessionId .. '.txt'
+  local physicalJsonlPath = physicalLogsPath .. 'randomIncidents_' .. safeSessionId .. '.jsonl'
+  return physicalTxtPath, physicalJsonlPath, virtualTxtPath, virtualJsonlPath
 end
 
 function M.testDiagnosticExportPath()
@@ -271,6 +310,10 @@ function M.testDiagnosticExportPath()
     report.normalizedPath = errorResult and errorResult.normalizedPath or report.logsPath
     report.baseUserPath = errorResult and errorResult.baseUserPath or report.normalizedUserPath
     report.failedStep = errorResult and errorResult.failedStep or 'unknown'
+    report.virtualPath = errorResult and errorResult.virtualPath or report.virtualLogsPath
+    report.physicalPath = errorResult and errorResult.physicalPath or report.physicalLogsPath
+    report.createResult = errorResult and errorResult.createResult or nil
+    report.existsAfter = errorResult and errorResult.existsAfter or false
     report.message = errorResult and errorResult.message or 'Unable to prepare diagnostic export path'
     return report
   end
@@ -294,22 +337,23 @@ end
 function M.exportLastSession()
   local session = lastSession or current
   if not session then return {ok=false, code='NO_SESSION', message='No diagnostic session is available'} end
-  local txtPath, jsonlPath = buildExportPaths(session.sessionId)
+  local txtPath, jsonlPath, virtualTxtPath, virtualJsonlPath = buildExportPaths(session.sessionId)
   if not txtPath then return jsonlPath end
   local txtTemp, jsonlTemp = txtPath .. '.tmp', jsonlPath .. '.tmp'
+  local virtualTxtTemp, virtualJsonlTemp = virtualTxtPath .. '.tmp', virtualJsonlPath .. '.tmp'
   local txt = io.open(txtTemp, 'w'); if not txt then return {ok=false, code='TXT_OPEN_FAILED', message='Unable to open TXT export'} end
   txt:write(textReport(session)); txt:close()
-  local jsonl = io.open(jsonlTemp, 'w'); if not jsonl then if FS and FS.removeFile then FS:removeFile(txtTemp) end; return {ok=false, code='JSONL_OPEN_FAILED', message='Unable to open JSONL export'} end
+  local jsonl = io.open(jsonlTemp, 'w'); if not jsonl then if FS and FS.removeFile then FS:removeFile(virtualTxtTemp) end; return {ok=false, code='JSONL_OPEN_FAILED', message='Unable to open JSONL export'} end
   local safe = copy(session, 0); safe.events = nil; safe._coalesced = nil; safe.recordType = 'session'
   jsonl:write(jsonEncode(safe) .. '\n')
   for _, event in ipairs(session.events or {}) do local eventRecord = copy(event, 0); eventRecord.recordType = 'event'; jsonl:write(jsonEncode(eventRecord) .. '\n') end
   jsonl:write(jsonEncode({recordType='summary', sessionId=session.sessionId, counters=copy(session.counters or {}, 0), eventCount=#(session.events or {})}) .. '\n'); jsonl:close()
-  if not FS or not FS.renameFile or FS:renameFile(txtTemp, txtPath) ~= 0 then
-    if FS and FS.removeFile then FS:removeFile(txtTemp); FS:removeFile(jsonlTemp) end
+  if not FS or not FS.renameFile or FS:renameFile(virtualTxtTemp, virtualTxtPath) ~= 0 then
+    if FS and FS.removeFile then FS:removeFile(virtualTxtTemp); FS:removeFile(virtualJsonlTemp) end
     return {ok=false, code='TXT_COMMIT_FAILED', message='Unable to commit TXT export'}
   end
-  if FS:renameFile(jsonlTemp, jsonlPath) ~= 0 then
-    if FS and FS.removeFile then FS:removeFile(jsonlTemp); FS:removeFile(txtPath) end
+  if FS:renameFile(virtualJsonlTemp, virtualJsonlPath) ~= 0 then
+    if FS and FS.removeFile then FS:removeFile(virtualJsonlTemp); FS:removeFile(virtualTxtPath) end
     return {ok=false, code='JSONL_COMMIT_FAILED', message='Unable to commit JSONL export'}
   end
   session.export = {txtPath=txtPath, jsonlPath=jsonlPath, exportedAt=os.date('!%Y-%m-%dT%H:%M:%SZ')}
