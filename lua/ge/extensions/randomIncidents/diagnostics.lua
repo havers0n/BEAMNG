@@ -182,13 +182,63 @@ function M.getLastSessionReport()
   local result = copy(session, 0); result._coalesced = nil; return result
 end
 
-local function paths(sessionId)
-  local base = FS and FS.getUserPath and FS:getUserPath() or nil
-  if not base then return nil, 'BeamNG user path is unavailable' end
-  local dir = base .. '/random_incident_generator/logs'
-  if FS.directoryExists and not FS:directoryExists(dir) then FS:directoryCreate(dir, true) end
-  if FS.directoryExists and not FS:directoryExists(dir) then return nil, 'Unable to create diagnostic log directory: ' .. dir end
-  return dir .. '/randomIncidents_' .. sessionId .. '.txt', dir .. '/randomIncidents_' .. sessionId .. '.jsonl'
+local function stripTrailingSeparators(path)
+  path = tostring(path or '')
+  if path:match('^%a:[\\/]$') then return path:sub(1, 2) .. '\\' end
+  return path:gsub('[/\\]+$', '')
+end
+
+local function normalizeUserPath(path)
+  return stripTrailingSeparators(tostring(path or ''):gsub('/', '\\'))
+end
+
+local function isWithinUserPath(path, base)
+  local lowerPath, lowerBase = string.lower(path), string.lower(base)
+  return lowerPath == lowerBase or lowerPath:sub(1, #lowerBase + 1) == lowerBase .. '\\'
+end
+
+local function pathError(code, normalizedPath, baseUserPath, failedStep, message)
+  return {ok=false, code=code, normalizedPath=normalizedPath, baseUserPath=baseUserPath, failedStep=failedStep, message=message}
+end
+
+local function pathProbe(message, fields)
+  M.log('DEBUG', 'export', 'export_path_probe', message, fields)
+end
+
+local function ensureDirectory(path, baseUserPath, failedStep)
+  local existsBefore = false
+  local existsOk, existsResult = pcall(function() return FS:directoryExists(path) end)
+  if existsOk then existsBefore = existsResult == true end
+  pathProbe(string.format('Export path step=%s path=%s directoryExistsBefore=%s', failedStep, path, tostring(existsBefore)), {path=path, directoryExistsBefore=existsBefore, step=failedStep})
+  if existsBefore then return true end
+
+  local createOk, createResult = pcall(function() return FS:directoryCreate(path, true) end)
+  local existsAfterOk, existsAfterResult = pcall(function() return FS:directoryExists(path) end)
+  local existsAfter = existsAfterOk and existsAfterResult == true
+  pathProbe(string.format('Export path step=%s path=%s directoryCreateResult=%s directoryExistsAfter=%s', failedStep, path, tostring(createResult), tostring(existsAfter)), {path=path, directoryCreateResult=createResult, directoryExistsAfter=existsAfter, step=failedStep})
+  if existsAfter then return true end
+  local reason = createOk and ('directoryCreate result=' .. tostring(createResult)) or ('directoryCreate exception=' .. tostring(createResult))
+  return false, pathError('DIRECTORY_CREATE_FAILED', path, baseUserPath, failedStep, 'Unable to create diagnostic directory: ' .. reason)
+end
+
+local function buildExportPaths(sessionId)
+  local rawBase = nil
+  local baseOk, baseResult = pcall(function() return FS and FS:getUserPath() end)
+  if baseOk then rawBase = baseResult end
+  local baseUserPath = normalizeUserPath(rawBase)
+  local parentPath = baseUserPath ~= '' and (baseUserPath .. '\\random_incident_generator') or ''
+  local exportDirectory = parentPath ~= '' and (parentPath .. '\\logs') or ''
+  pathProbe(string.format('Export path rawUserPath=%s normalizedUserPath=%s exportDirectory=%s', tostring(rawBase), baseUserPath, exportDirectory), {rawUserPath=rawBase, normalizedUserPath=baseUserPath, exportDirectory=exportDirectory})
+  if not baseOk or baseUserPath == '' then return nil, pathError('USER_PATH_UNAVAILABLE', exportDirectory, baseUserPath, 'resolve_user_path', 'BeamNG user path is unavailable') end
+  if not isWithinUserPath(parentPath, baseUserPath) or not isWithinUserPath(exportDirectory, baseUserPath) then return nil, pathError('PATH_OUTSIDE_USER_PATH', exportDirectory, baseUserPath, 'validate_path', 'Diagnostic export path is outside BeamNG user path') end
+  if not FS or not FS.directoryExists or not FS.directoryCreate then return nil, pathError('FS_API_UNAVAILABLE', exportDirectory, baseUserPath, 'validate_fs_api', 'BeamNG filesystem API is unavailable') end
+
+  local parentOk, parentError = ensureDirectory(parentPath, baseUserPath, 'create_parent')
+  if not parentOk then return nil, parentError end
+  local exportOk, exportError = ensureDirectory(exportDirectory, baseUserPath, 'create_export_directory')
+  if not exportOk then return nil, exportError end
+  local safeSessionId = tostring(sessionId or ''):gsub('[^%w%-_]', '_')
+  return exportDirectory .. '\\randomIncidents_' .. safeSessionId .. '.txt', exportDirectory .. '\\randomIncidents_' .. safeSessionId .. '.jsonl'
 end
 
 local function textReport(session)
@@ -207,8 +257,8 @@ end
 function M.exportLastSession()
   local session = lastSession or current
   if not session then return {ok=false, code='NO_SESSION', message='No diagnostic session is available'} end
-  local txtPath, jsonlPath = paths(session.sessionId)
-  if not txtPath then return {ok=false, code='PATH_UNAVAILABLE', message=jsonlPath} end
+  local txtPath, jsonlPath = buildExportPaths(session.sessionId)
+  if not txtPath then return jsonlPath end
   local txtTemp, jsonlTemp = txtPath .. '.tmp', jsonlPath .. '.tmp'
   local txt = io.open(txtTemp, 'w'); if not txt then return {ok=false, code='TXT_OPEN_FAILED', message='Unable to open TXT export'} end
   txt:write(textReport(session)); txt:close()

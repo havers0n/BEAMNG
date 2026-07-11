@@ -32,6 +32,18 @@ local function getVehicleObjectId(vehicle)
   if vehicle and vehicle.getID then pcall(function() id = vehicle:getID() end) end
   return id
 end
+local function getCurrentMapName()
+  local missionFilename = nil
+  if type(getMissionFilename) == 'function' then pcall(function() missionFilename = getMissionFilename() end) end
+  local levelName = nil
+  if core_levels and core_levels.getLevelName and missionFilename then
+    pcall(function() levelName = core_levels.getLevelName(missionFilename) end)
+  end
+  if type(levelName) ~= 'string' or levelName == '' then
+    levelName = type(missionFilename) == 'string' and (missionFilename:match('^/*levels/([^/]+)/') or missionFilename:match('^[\\/]levels[\\/]([^\\/]+)[\\/]')) or nil
+  end
+  return type(levelName) == 'string' and levelName ~= '' and levelName or 'unknown'
+end
 local savedSpotsPath = '/settings/randomIncidents_spots.json'
 local spots = {}
 local generatedVehicles = {}
@@ -1369,7 +1381,7 @@ local function logOppositeCandidateDiagnostics(diagnostics)
   local limit = math.min(5, #candidates)
   for index = 1, limit do
     local item = candidates[index]
-    log(item.accepted and 'I' or 'W', logTag, string.format(
+    log(item.accepted and 'I' or 'D', logTag, string.format(
       'Opposite candidate rank=%d nodes=%s<->%s accepted=%s reason=%s score=%.2f edgeLength=%.2f lateral=%.2f longitudinal=%.2f vertical=%.2f directionDot=%.3f drivability=%.2f oneWay=%s',
       index, tostring(item.nodeA), tostring(item.nodeB), tostring(item.accepted), diagnosticReasonText(item),
       tonumber(item.score) or math.huge, tonumber(item.edgeLength) or 0, tonumber(item.lateralSeparation) or 0,
@@ -2202,6 +2214,7 @@ local function generateScenarioFromActiveDefinition(seed, travelDirectionOverrid
   generatedVehicles = spawnedEntries
   generatedScene = {
     scenarioId = activeScenarioDefinition.id,
+    mapName = getCurrentMapName(),
     scenarioVersion = activeScenarioDefinition.version,
     scenarioDefinition = scenarioRegistry.copy(activeScenarioDefinition),
     preset = activeScenarioDefinition.name,
@@ -2340,7 +2353,7 @@ function M.printScenarioDefinition(scenarioId)
 end
 
 function M.generateScenario(scenarioId, seed, travelDirectionOverride)
-  diagnostics.beginSession({scenarioId = scenarioId or DEFAULT_SCENARIO_ID, seed = seed, scenarioVersion = activeScenarioDefinition and activeScenarioDefinition.version, phase = activeScenarioDefinition and activeScenarioDefinition.phase})
+  diagnostics.beginSession({scenarioId = scenarioId or DEFAULT_SCENARIO_ID, seed = seed, mapName = getCurrentMapName(), scenarioVersion = activeScenarioDefinition and activeScenarioDefinition.version, phase = activeScenarioDefinition and activeScenarioDefinition.phase})
   local definition, errorMessage = scenarioRegistry.get(scenarioId or DEFAULT_SCENARIO_ID)
   if not definition then
     log('E', logTag, string.format('Cannot generate unknown scenario %s: %s', tostring(scenarioId), tostring(errorMessage)))
@@ -3080,7 +3093,7 @@ function M.repeatScene()
 
   local scene = generatedScene
   local parentSessionId = diagnostics.getCurrentSessionId()
-  diagnostics.beginSession({scenarioId = scene.scenarioId, seed = scene.seed, scenarioVersion = scene.scenarioVersion, phase = scene.phase}, parentSessionId, true)
+  diagnostics.beginSession({scenarioId = scene.scenarioId, seed = scene.seed, mapName = scene.mapName or getCurrentMapName(), scenarioVersion = scene.scenarioVersion, phase = scene.phase}, parentSessionId, true)
   local oldVehicleIds = {}
   for _, entry in ipairs(generatedVehicles) do
     local id = '?'
