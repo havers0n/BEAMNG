@@ -184,7 +184,7 @@ function M.startSession(config)
   config = type(config) == 'table' and config or {}
   local actors = {}
   for _, actor in ipairs(config.actors or {}) do table.insert(actors, sanitizeActor(actor)) end
-  current = {sessionId=tostring(config.sessionId or ''), scenarioId=safeScalar(config.scenarioId), seed=safeScalar(config.seed), status='RUNNING', startedAtSceneTime=0,
+  current = {sessionId=tostring(config.sessionId or ''), scenarioId=safeScalar(config.scenarioId), seed=safeScalar(config.seed), status='ACTIVE', startedAtSceneTime=0,
     stoppedAtSceneTime=nil, sceneTime=0, sampleInterval=finite(config.sampleInterval) and config.sampleInterval > 0 and config.sampleInterval or DEFAULT_INTERVAL,
     accumulator=0, actors=actors, samples={}, latestByActor={}, summaries={}, unavailable={}, droppedSampleCount=0, invalidFieldCount=0,
     diagnostics=config.diagnostics, objectProvider=config.objectProvider, controllerStateProvider=config.controllerStateProvider, bufferOverflowReported=false}
@@ -194,7 +194,7 @@ function M.startSession(config)
 end
 
 function M.update(dtSim)
-  if not current or current.status ~= 'RUNNING' then return false end
+  if not current or current.status ~= 'ACTIVE' then return false end
   local delta = tonumber(dtSim)
   if not finite(delta) or delta <= 0 then return false end
   current.sceneTime = current.sceneTime + delta

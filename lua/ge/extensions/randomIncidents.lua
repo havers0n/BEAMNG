@@ -1,4 +1,4 @@
-print("RANDOM INCIDENTS LUA FILE LOADED v2.3.3 - SCENARIO ENGINE V2 COMMIT 7.3 DIAGNOSTIC SESSION EXPORT")
+print("RANDOM INCIDENTS LUA FILE LOADED v2.3.4 - RUNTIME TELEMETRY FILE EXPORT")
 -- Random Incident Generator - Phase 1: Spot Harvester
 -- Harvests candidate incident locations from the loaded level navgraph.
 
@@ -7,6 +7,9 @@ local M = {}
 local logTag = 'randomIncidents'
 local diagnostics = require('lua/ge/extensions/randomIncidents/diagnostics')
 local runtimeTelemetry = require('lua/ge/extensions/randomIncidents/runtimeTelemetry')
+local telemetryExport = require('lua/ge/extensions/randomIncidents/telemetryExport')
+local runtimeTelemetryAutoExport = true
+local runtimeTelemetryExportCount = 0
 local function log(level, tag, message)
   local normalized = ({D='DEBUG', I='INFO', W='WARN', E='ERROR'})[level] or tostring(level):upper()
   local text = tostring(message or '')
@@ -74,6 +77,28 @@ local function startRuntimeTelemetryForGeneratedScene()
       return nil
     end,
   })
+end
+
+-- Freeze before exporting.  The exporter receives only a report snapshot and
+-- never reaches into the live sampler, so clear/repeat cannot mix sessions.
+local function finalizeRuntimeTelemetry(reason, automatic)
+  local report = runtimeTelemetry.getReport()
+  if not report or report.status ~= 'ACTIVE' then return nil end
+  runtimeTelemetry.stopSession(reason)
+  report = runtimeTelemetry.getReport()
+  if not automatic or not runtimeTelemetryAutoExport or not report or report.actorCount == 0 or report.sampleCount == 0 then return nil end
+  diagnostics.log('INFO', 'telemetry', 'telemetry_export_started', 'Runtime telemetry auto-export started', {sessionId=report.sessionId, reason=reason})
+  local result = telemetryExport.export(report, {exportCount=runtimeTelemetryExportCount})
+  if result.ok then
+    runtimeTelemetryExportCount = result.exportCount
+    diagnostics.log('INFO', 'telemetry', 'telemetry_export_completed', 'Runtime telemetry export completed', {sessionId=result.sessionId, sampleCount=result.sampleCount})
+    diagnostics.log('INFO', 'telemetry', 'telemetry_auto_export_completed', 'Runtime telemetry auto-export completed', {sessionId=result.sessionId})
+    log('I', logTag, string.format('Runtime telemetry exported: %s actors=%d samples=%d', result.jsonlPath, result.actorCount, result.sampleCount))
+  else
+    diagnostics.log('WARN', 'telemetry', 'telemetry_export_failed', 'Runtime telemetry export failed: ' .. tostring(result.message), {sessionId=report.sessionId, code=result.code})
+    diagnostics.log('WARN', 'telemetry', 'telemetry_auto_export_failed', 'Runtime telemetry auto-export failed', {sessionId=report.sessionId, code=result.code})
+  end
+  return result
 end
 
 -- Rear-end scene tuning. Speeds are always metres per second.
@@ -1840,7 +1865,7 @@ local function spawnAmbientVehicleWithFallback(spec, position, rotation, ambient
 end
 
 function M.clearGeneratedVehicles()
-  runtimeTelemetry.stopSession('CLEARED')
+  finalizeRuntimeTelemetry('CLEARED', true)
   log('I', logTag, string.format('Clearing %d generated vehicles', #generatedVehicles))
   for index, entry in ipairs(generatedVehicles) do
     local vehicle = entry.vehicle or entry
@@ -2382,7 +2407,7 @@ function M.printScenarioDefinition(scenarioId)
 end
 
 function M.generateScenario(scenarioId, seed, travelDirectionOverride)
-  runtimeTelemetry.stopSession('NEW_GENERATE')
+  finalizeRuntimeTelemetry('NEW_GENERATE', true)
   diagnostics.beginSession({scenarioId = scenarioId or DEFAULT_SCENARIO_ID, seed = seed, mapName = getCurrentMapName(), scenarioVersion = activeScenarioDefinition and activeScenarioDefinition.version, phase = activeScenarioDefinition and activeScenarioDefinition.phase})
   local definition, errorMessage = scenarioRegistry.get(scenarioId or DEFAULT_SCENARIO_ID)
   if not definition then
@@ -3058,9 +3083,8 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     timeline.completedAt = timeline.elapsed
     timeline.phase = 'complete'
     diagnostics.setStatus('COMPLETED')
-    runtimeTelemetry.stopSession('COMPLETED')
     log('I', logTag, string.format(
-      'Scenario Timeline v2 reached nominal duration %.2fs; leadBrake=%s targetBrake=%s leadHazardGap=%s targetLeadGap=%s triggerEvents=%d',
+      'Telemetry nominal timeline completed at %.2fs; telemetry remains ACTIVE; leadBrake=%s targetBrake=%s leadHazardGap=%s targetLeadGap=%s triggerEvents=%d',
       timeline.elapsed, tostring(timeline.leadBrakeTriggered), tostring(timeline.targetBrakeTriggered),
       leadHazardGap and string.format('%.2f', leadHazardGap) or 'n/a',
       targetLeadGap and string.format('%.2f', targetLeadGap) or 'n/a',
@@ -3124,7 +3148,7 @@ function M.repeatScene()
   end
 
   local scene = generatedScene
-  runtimeTelemetry.stopSession('REPEATED')
+  finalizeRuntimeTelemetry('REPEATED', true)
   local parentSessionId = diagnostics.getCurrentSessionId()
   diagnostics.beginSession({scenarioId = scene.scenarioId, seed = scene.seed, mapName = scene.mapName or getCurrentMapName(), scenarioVersion = scene.scenarioVersion, phase = scene.phase}, parentSessionId, true)
   local oldVehicleIds = {}
@@ -3391,7 +3415,30 @@ function M.getLastSessionReport() return diagnostics.getLastSessionReport() end
 function M.printLastSessionSummary() return diagnostics.printSummary() end
 function M.clearDiagnosticHistory() diagnostics.clearHistory(); return true end
 function M.getRuntimeTelemetryReport() return runtimeTelemetry.getReport() end
-function M.clearRuntimeTelemetry() return runtimeTelemetry.clear() end
+function M.clearRuntimeTelemetry()
+  finalizeRuntimeTelemetry('CLEARED', true)
+  return runtimeTelemetry.clear()
+end
+function M.stopRuntimeTelemetry(reason)
+  return finalizeRuntimeTelemetry(reason or 'STOPPED', true) or {ok=true, stopped=false}
+end
+function M.exportRuntimeTelemetry()
+  local report = runtimeTelemetry.getReport()
+  if not report then return {ok=false, code='NO_REPORT', failedStep='get_report', message='No runtime telemetry report is available'} end
+  diagnostics.log('INFO', 'telemetry', 'telemetry_export_started', 'Runtime telemetry export started', {sessionId=report.sessionId})
+  local result = telemetryExport.export(report, {exportCount=runtimeTelemetryExportCount})
+  if result.ok then
+    runtimeTelemetryExportCount = result.exportCount
+    diagnostics.log('INFO', 'telemetry', 'telemetry_export_completed', 'Runtime telemetry export completed', {sessionId=result.sessionId, sampleCount=result.sampleCount})
+    log('I', logTag, string.format('Runtime telemetry exported: %s actors=%d samples=%d', result.jsonlPath, result.actorCount, result.sampleCount))
+  else
+    diagnostics.log('WARN', 'telemetry', 'telemetry_export_failed', 'Runtime telemetry export failed: ' .. tostring(result.message), {sessionId=report.sessionId, code=result.code})
+  end
+  return result
+end
+function M.getLastRuntimeTelemetryExport() return telemetryExport.getLastResult() end
+function M.setRuntimeTelemetryAutoExport(enabled) runtimeTelemetryAutoExport = enabled == true; return runtimeTelemetryAutoExport end
+function M.getRuntimeTelemetryAutoExport() return runtimeTelemetryAutoExport end
 function M.printRuntimeTelemetrySummary()
   local summary = runtimeTelemetry.getSummary()
   if not summary then
@@ -3414,7 +3461,7 @@ function M.printRuntimeTelemetrySummary()
   return summary
 end
 function M.onExtensionUnloaded()
-  runtimeTelemetry.stopSession('UNLOADED')
+  finalizeRuntimeTelemetry('UNLOADED', true)
   if #generatedVehicles > 0 then M.clearGeneratedVehicles() end
   diagnostics.setStatus('UNLOADED')
   diagnostics.finish('UNLOADED')
