@@ -6,6 +6,7 @@ local M = {}
 
 local logTag = 'randomIncidents'
 local diagnostics = require('lua/ge/extensions/randomIncidents/diagnostics')
+local runtimeTelemetry = require('lua/ge/extensions/randomIncidents/runtimeTelemetry')
 local function log(level, tag, message)
   local normalized = ({D='DEBUG', I='INFO', W='WARN', E='ERROR'})[level] or tostring(level):upper()
   local text = tostring(message or '')
@@ -48,6 +49,32 @@ local savedSpotsPath = '/settings/randomIncidents_spots.json'
 local spots = {}
 local generatedVehicles = {}
 local generatedScene = nil
+
+local function startRuntimeTelemetryForGeneratedScene()
+  if not generatedScene then return nil end
+  local actors = {}
+  for _, entry in ipairs(generatedVehicles) do
+    table.insert(actors, {
+      label = entry.label,
+      objectId = getVehicleObjectId(entry.vehicle),
+      role = entry.role,
+      ambient = entry.isAmbient == true,
+    })
+  end
+  return runtimeTelemetry.startSession({
+    sessionId = diagnostics.getCurrentSessionId(),
+    scenarioId = generatedScene.scenarioId,
+    seed = generatedScene.seed,
+    actors = actors,
+    diagnostics = diagnostics,
+    controllerStateProvider = function(label)
+      for _, entry in ipairs(generatedVehicles) do
+        if entry.label == label then return entry.controller and entry.controller.state or nil end
+      end
+      return nil
+    end,
+  })
+end
 
 -- Rear-end scene tuning. Speeds are always metres per second.
 local leadSpeedMps = 10
@@ -1813,6 +1840,7 @@ local function spawnAmbientVehicleWithFallback(spec, position, rotation, ambient
 end
 
 function M.clearGeneratedVehicles()
+  runtimeTelemetry.stopSession('CLEARED')
   log('I', logTag, string.format('Clearing %d generated vehicles', #generatedVehicles))
   for index, entry in ipairs(generatedVehicles) do
     local vehicle = entry.vehicle or entry
@@ -2277,6 +2305,7 @@ local function generateScenarioFromActiveDefinition(seed, travelDirectionOverrid
     queuedAICommands = {},
   }
   for _, entry in ipairs(generatedVehicles) do diagnostics.registerActor(entry) end
+  startRuntimeTelemetryForGeneratedScene()
 
   log('I', logTag, string.format(
     'Scenario definition %s v%s generated: actors=%d ambient=%d vehicles=%d spot=%s length=%.2f trafficSide=%s oneWay=%s roadDir=%d lane=%d/%d initialHazardGap=%.2f hazardSpeed=%.2f expectedLeadTrigger=%.2fs targetPathNodes=%d; call start()',
@@ -2353,6 +2382,7 @@ function M.printScenarioDefinition(scenarioId)
 end
 
 function M.generateScenario(scenarioId, seed, travelDirectionOverride)
+  runtimeTelemetry.stopSession('NEW_GENERATE')
   diagnostics.beginSession({scenarioId = scenarioId or DEFAULT_SCENARIO_ID, seed = seed, mapName = getCurrentMapName(), scenarioVersion = activeScenarioDefinition and activeScenarioDefinition.version, phase = activeScenarioDefinition and activeScenarioDefinition.phase})
   local definition, errorMessage = scenarioRegistry.get(scenarioId or DEFAULT_SCENARIO_ID)
   if not definition then
@@ -2999,6 +3029,7 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
   if delta <= 0 then return end
   timeline.elapsed = (timeline.elapsed or 0) + delta
   diagnostics.setSceneTime(timeline.elapsed)
+  runtimeTelemetry.update(delta)
 
   local direction = generatedScene.dir and vec3(generatedScene.dir.x, generatedScene.dir.y, generatedScene.dir.z) or nil
   updateVehicleControllers(delta, direction)
@@ -3027,6 +3058,7 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     timeline.completedAt = timeline.elapsed
     timeline.phase = 'complete'
     diagnostics.setStatus('COMPLETED')
+    runtimeTelemetry.stopSession('COMPLETED')
     log('I', logTag, string.format(
       'Scenario Timeline v2 reached nominal duration %.2fs; leadBrake=%s targetBrake=%s leadHazardGap=%s targetLeadGap=%s triggerEvents=%d',
       timeline.elapsed, tostring(timeline.leadBrakeTriggered), tostring(timeline.targetBrakeTriggered),
@@ -3092,6 +3124,7 @@ function M.repeatScene()
   end
 
   local scene = generatedScene
+  runtimeTelemetry.stopSession('REPEATED')
   local parentSessionId = diagnostics.getCurrentSessionId()
   diagnostics.beginSession({scenarioId = scene.scenarioId, seed = scene.seed, mapName = scene.mapName or getCurrentMapName(), scenarioVersion = scene.scenarioVersion, phase = scene.phase}, parentSessionId, true)
   local oldVehicleIds = {}
@@ -3195,6 +3228,7 @@ function M.repeatScene()
   generatedScene = scene
   generatedScene.queuedAICommands = {}
   for _, entry in ipairs(generatedVehicles) do diagnostics.registerActor(entry) end
+  startRuntimeTelemetryForGeneratedScene()
   log('I', logTag, string.format('New vehicle IDs spawned: %s', table.concat(newVehicleIds, ', ')))
 
   log('I', logTag, 'Repeat step 3/3: reapplying AI and starting the same scene')
@@ -3356,7 +3390,31 @@ function M.exportCurrentSessionLog() return diagnostics.exportLastSession() end
 function M.getLastSessionReport() return diagnostics.getLastSessionReport() end
 function M.printLastSessionSummary() return diagnostics.printSummary() end
 function M.clearDiagnosticHistory() diagnostics.clearHistory(); return true end
+function M.getRuntimeTelemetryReport() return runtimeTelemetry.getReport() end
+function M.clearRuntimeTelemetry() return runtimeTelemetry.clear() end
+function M.printRuntimeTelemetrySummary()
+  local summary = runtimeTelemetry.getSummary()
+  if not summary then
+    log('W', logTag, 'No runtime telemetry report is available')
+    return nil
+  end
+  log('I', logTag, string.format(
+    'Runtime telemetry session=%s scenario=%s seed=%s actors=%d samples=%d dropped=%d',
+    tostring(summary.sessionId), tostring(summary.scenarioId), tostring(summary.seed),
+    summary.actorCount, summary.sampleCount, summary.droppedSampleCount
+  ))
+  for _, actor in ipairs(summary.actorSummaries or {}) do
+    log('I', logTag, string.format(
+      'Telemetry actor=%s samples=%d speed[min=%.2f max=%.2f final=%.2f] maxDecel=%s distance=%.2f missing=%d',
+      tostring(actor.actor), actor.sampleCount or 0, actor.minSpeedMps or 0, actor.maxSpeedMps or 0,
+      actor.finalSpeedMps or 0, actor.maxDecelerationMps2 and string.format('%.2f', actor.maxDecelerationMps2) or 'n/a',
+      actor.approximateDistanceMeters or 0, actor.missingSampleCount or 0
+    ))
+  end
+  return summary
+end
 function M.onExtensionUnloaded()
+  runtimeTelemetry.stopSession('UNLOADED')
   if #generatedVehicles > 0 then M.clearGeneratedVehicles() end
   diagnostics.setStatus('UNLOADED')
   diagnostics.finish('UNLOADED')
