@@ -1,10 +1,37 @@
-print("RANDOM INCIDENTS LUA FILE LOADED v2.3.2 - SCENARIO ENGINE V2 COMMIT 7.2 PATH-SAFE FOLLOWING")
+print("RANDOM INCIDENTS LUA FILE LOADED v2.3.3 - SCENARIO ENGINE V2 COMMIT 7.3 DIAGNOSTIC SESSION EXPORT")
 -- Random Incident Generator - Phase 1: Spot Harvester
 -- Harvests candidate incident locations from the loaded level navgraph.
 
 local M = {}
 
 local logTag = 'randomIncidents'
+local diagnostics = require('lua/ge/extensions/randomIncidents/diagnostics')
+local function log(level, tag, message)
+  local normalized = ({D='DEBUG', I='INFO', W='WARN', E='ERROR'})[level] or tostring(level):upper()
+  local text = tostring(message or '')
+  local category = 'lifecycle'
+  if text:match('[Tt]rigger') then category = 'trigger'
+  elseif text:match('[Ff]ollow') then category = 'following'
+  elseif text:match('[Aa]mbient') then category = 'ambient'
+  elseif text:match('[Cc]ontroller') then category = 'ai'
+  elseif text:match('[Ss]pawn') or text:match('[Ss]pawned') then category = 'spawn'
+  elseif text:match('[Ee]xport') then category = 'export'
+  elseif text:match('[Gg]enerat') then category = 'scenario' end
+  local eventType = text:lower():gsub('[^%w]+', '_'):gsub('^_+', ''):sub(1, 80)
+  if text:match('Following speed sync') then eventType = 'following_speed_sync' end
+  local actor = text:match('([%w%s]+) target=') or text:match('for ([%w%s]+)')
+  local fields = actor and {actor = actor} or nil
+  if eventType == 'following_speed_sync' then
+    actor = text:match('Following speed sync (.-) target=') or actor
+    fields = {actor = actor, target = text:match('target=([^%s]+)'), speed = tonumber(text:match('speed=([%+%-]?[%d%.]+)'))}
+  end
+  diagnostics.log(normalized, category, eventType, text, fields)
+end
+local function getVehicleObjectId(vehicle)
+  local id = nil
+  if vehicle and vehicle.getID then pcall(function() id = vehicle:getID() end) end
+  return id
+end
 local savedSpotsPath = '/settings/randomIncidents_spots.json'
 local spots = {}
 local generatedVehicles = {}
@@ -493,6 +520,8 @@ local function queueVehicleAI(vehicle, speed, label, targetPath, driveInLane)
     generatedScene.queuedAICommands = generatedScene.queuedAICommands or {}
     generatedScene.queuedAICommands[label] = command
   end
+  local objectId = getVehicleObjectId(vehicle)
+  diagnostics.recordCommand(label, objectId, 'queueVehicleAI', command)
   return ok, pathValid, #((pathNodes or {}))
 end
 
@@ -511,6 +540,8 @@ local function queueFollowingSpeedSync(entry, targetSpeed)
     generatedScene.queuedAICommands = generatedScene.queuedAICommands or {}
     generatedScene.queuedAICommands[entry.label .. ' followingSpeedSync'] = command
   end
+  local objectId = getVehicleObjectId(entry.vehicle)
+  diagnostics.recordCommand(entry.label, objectId, 'following_speed_sync', command)
   return true
 end
 
@@ -557,6 +588,8 @@ local function queueAmbientVehicleAI(entry, targetPath)
     generatedScene.queuedAICommands = generatedScene.queuedAICommands or {}
     generatedScene.queuedAICommands[entry.label] = command
   end
+  local objectId = getVehicleObjectId(vehicle)
+  diagnostics.recordCommand(entry.label, objectId, 'queueAmbientVehicleAI', command)
   return ok
 end
 
@@ -586,6 +619,8 @@ local function queueVehicleBrake(vehicle, label, brakeAmount, commandName)
     generatedScene.queuedAICommands = generatedScene.queuedAICommands or {}
     generatedScene.queuedAICommands[label .. ' ' .. commandName] = command
   end
+  local objectId = getVehicleObjectId(vehicle)
+  diagnostics.recordCommand(label, objectId, commandName, command)
   return ok
 end
 
@@ -617,6 +652,8 @@ local function queueVehicleSteering(vehicle, label, steeringAmount, commandName,
     generatedScene.queuedAICommands = generatedScene.queuedAICommands or {}
     generatedScene.queuedAICommands[label .. ' ' .. commandName] = command
   end
+  local objectId = getVehicleObjectId(vehicle)
+  diagnostics.recordCommand(label, objectId, commandName, command)
   return ok
 end
 
@@ -639,6 +676,8 @@ local function queueVehicleStoppedHold(vehicle, label, reason)
     generatedScene.queuedAICommands = generatedScene.queuedAICommands or {}
     generatedScene.queuedAICommands[label .. ' stoppedHold'] = command
   end
+  local objectId = getVehicleObjectId(vehicle)
+  diagnostics.recordCommand(label, objectId, 'stopped_hold', command)
   return ok
 end
 
@@ -1904,6 +1943,7 @@ function M.generateRearEnd(seed)
 end
 
 local function generateScenarioFromActiveDefinition(seed, travelDirectionOverride)
+  diagnostics.setStatus('GENERATING')
   log('I', logTag, string.format(
     'Generating road scenario preset=%s phase=%s seed=%s directionOverride=%s',
     activeScenarioDefinition.name, activeScenarioDefinition.phase, tostring(seed), tostring(travelDirectionOverride)
@@ -2223,6 +2263,7 @@ local function generateScenarioFromActiveDefinition(seed, travelDirectionOverrid
     },
     queuedAICommands = {},
   }
+  for _, entry in ipairs(generatedVehicles) do diagnostics.registerActor(entry) end
 
   log('I', logTag, string.format(
     'Scenario definition %s v%s generated: actors=%d ambient=%d vehicles=%d spot=%s length=%.2f trafficSide=%s oneWay=%s roadDir=%d lane=%d/%d initialHazardGap=%.2f hazardSpeed=%.2f expectedLeadTrigger=%.2fs targetPathNodes=%d; call start()',
@@ -2299,14 +2340,19 @@ function M.printScenarioDefinition(scenarioId)
 end
 
 function M.generateScenario(scenarioId, seed, travelDirectionOverride)
+  diagnostics.beginSession({scenarioId = scenarioId or DEFAULT_SCENARIO_ID, seed = seed, scenarioVersion = activeScenarioDefinition and activeScenarioDefinition.version, phase = activeScenarioDefinition and activeScenarioDefinition.phase})
   local definition, errorMessage = scenarioRegistry.get(scenarioId or DEFAULT_SCENARIO_ID)
   if not definition then
     log('E', logTag, string.format('Cannot generate unknown scenario %s: %s', tostring(scenarioId), tostring(errorMessage)))
+    diagnostics.setStatus('FAILED')
     return nil
   end
 
   activeScenarioDefinition = definition
-  return generateScenarioFromActiveDefinition(seed, travelDirectionOverride)
+  diagnostics.updateMetadata({scenarioId = definition.id, scenarioVersion = definition.version, phase = definition.phase})
+  local result = generateScenarioFromActiveDefinition(seed, travelDirectionOverride)
+  if result then diagnostics.setStatus('GENERATED') else diagnostics.setStatus('FAILED') end
+  return result
 end
 
 function M.generateShortsPileup(seed, travelDirectionOverride)
@@ -2516,6 +2562,7 @@ end
 local function applyTriggerEventToTimeline(event)
   if not event or not generatedScene or not generatedScene.timeline then return end
   local timeline = generatedScene.timeline
+  diagnostics.recordTrigger()
   if event.phase then timeline.phase = event.phase end
   if event.legacyFlag then timeline[event.legacyFlag] = true end
   if event.legacyTimestamp then timeline[event.legacyTimestamp] = event.firedAt end
@@ -2591,6 +2638,7 @@ local function fireScenarioTrigger(triggerId, source)
 end
 
 function M.start()
+  diagnostics.setStatus('RUNNING')
   log('I', logTag, string.format('Starting generated vehicle AI movement for %d vehicles', #generatedVehicles))
   local ambientStarted = 0
   for _, entry in ipairs(generatedVehicles) do
@@ -2937,6 +2985,7 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
   local delta = tonumber(dtSim) or tonumber(dtReal) or tonumber(dtRaw) or 0
   if delta <= 0 then return end
   timeline.elapsed = (timeline.elapsed or 0) + delta
+  diagnostics.setSceneTime(timeline.elapsed)
 
   local direction = generatedScene.dir and vec3(generatedScene.dir.x, generatedScene.dir.y, generatedScene.dir.z) or nil
   updateVehicleControllers(delta, direction)
@@ -2964,6 +3013,7 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     timeline.completed = true
     timeline.completedAt = timeline.elapsed
     timeline.phase = 'complete'
+    diagnostics.setStatus('COMPLETED')
     log('I', logTag, string.format(
       'Scenario Timeline v2 reached nominal duration %.2fs; leadBrake=%s targetBrake=%s leadHazardGap=%s targetLeadGap=%s triggerEvents=%d',
       timeline.elapsed, tostring(timeline.leadBrakeTriggered), tostring(timeline.targetBrakeTriggered),
@@ -2984,6 +3034,7 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
 end
 
 function M.reset()
+  diagnostics.setStatus('RESET')
   log('I', logTag, 'Resetting generated vehicles to initial positions')
   for _, entry in ipairs(generatedVehicles) do
     local vehicle = entry.vehicle
@@ -3028,6 +3079,8 @@ function M.repeatScene()
   end
 
   local scene = generatedScene
+  local parentSessionId = diagnostics.getCurrentSessionId()
+  diagnostics.beginSession({scenarioId = scene.scenarioId, seed = scene.seed, scenarioVersion = scene.scenarioVersion, phase = scene.phase}, parentSessionId, true)
   local oldVehicleIds = {}
   for _, entry in ipairs(generatedVehicles) do
     local id = '?'
@@ -3128,6 +3181,7 @@ function M.repeatScene()
   generatedVehicles = respawnedEntries
   generatedScene = scene
   generatedScene.queuedAICommands = {}
+  for _, entry in ipairs(generatedVehicles) do diagnostics.registerActor(entry) end
   log('I', logTag, string.format('New vehicle IDs spawned: %s', table.concat(newVehicleIds, ', ')))
 
   log('I', logTag, 'Repeat step 3/3: reapplying AI and starting the same scene')
@@ -3274,6 +3328,26 @@ function M.printSceneSummary()
   end
   return scene
 end
+
+function M.setConsoleLogLevel(level) return diagnostics.setConsoleLogLevel(level) end
+function M.getConsoleLogLevel() return diagnostics.getConsoleLogLevel() end
+function M.setDiagnosticCaptureLevel(level) return diagnostics.setDiagnosticCaptureLevel(level) end
+function M.getDiagnosticCaptureLevel() return diagnostics.getDiagnosticCaptureLevel() end
+function M.exportLastSessionLog()
+  local result = diagnostics.exportLastSession()
+  if result.ok then log('I', logTag, 'Diagnostic session exported: ' .. tostring(result.txtPath)) else log('E', logTag, 'Diagnostic session export failed: ' .. tostring(result.message)) end
+  return result
+end
+function M.exportCurrentSessionLog() return diagnostics.exportLastSession() end
+function M.getLastSessionReport() return diagnostics.getLastSessionReport() end
+function M.printLastSessionSummary() return diagnostics.printSummary() end
+function M.clearDiagnosticHistory() diagnostics.clearHistory(); return true end
+function M.onExtensionUnloaded()
+  if #generatedVehicles > 0 then M.clearGeneratedVehicles() end
+  diagnostics.setStatus('UNLOADED')
+  diagnostics.finish('UNLOADED')
+end
+M.onUnload = M.onExtensionUnloaded
 
 -- Keep the public spot-query API explicitly exported before returning the module.
 M.countSpotsByType = M.countSpotsByType
