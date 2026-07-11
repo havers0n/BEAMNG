@@ -118,10 +118,13 @@ function M.updateMetadata(meta)
   return true
 end
 
+local normalizeCapturedEvent
+
 function M.log(level, category, eventType, message, fields)
   local normalized = normalizeLevel(level) or 'INFO'
   local numeric = LEVELS[normalized]
   local safeFields = copy(fields or {}, 0)
+  eventType, safeFields = normalizeCapturedEvent(category, eventType, message, safeFields, current and current.sceneTime or 0)
   if current and numeric >= captureLevel then
     local key = eventKey(category, eventType, safeFields)
     local coalesce = normalized == 'DEBUG' and (eventType == 'following_speed_sync' or eventType == 'following_speed_sync_detail')
@@ -357,6 +360,34 @@ function M.testDiagnosticExportPath()
   return report
 end
 
+normalizeCapturedEvent = function(category, eventType, message, fields, sceneTime)
+  local normalizedEventType = tostring(eventType or 'message')
+  fields = fields or {}
+  if category == 'trigger' then
+    if tostring(message):match('Trigger reaction scheduled') then normalizedEventType = 'trigger_reaction_scheduled'
+    elseif tostring(message):match('Trigger fired') then normalizedEventType = 'trigger_fired'
+    elseif tostring(message):match('[Tt]rigger [^:]+ cancelled') then normalizedEventType = 'trigger_cancelled' end
+    if normalizedEventType == 'trigger_fired' or normalizedEventType == 'trigger_reaction_scheduled' then
+      fields.triggerId = fields.triggerId or tostring(message):match('id=([^%s]+)')
+      fields.group = fields.group or tostring(message):match('group=([^%s]+)')
+      fields.subject = fields.subject or tostring(message):match('subject=([^%s]+)')
+      fields.target = fields.target or tostring(message):match('target=([^%s]+)')
+      fields.metric = fields.metric or tostring(message):match('metric=([^%s]+)')
+      fields.value = fields.value or tonumber(tostring(message):match('value=([^%s]+)'))
+      fields.threshold = fields.threshold or tonumber(tostring(message):match('threshold=([^%s]+)'))
+      fields.sceneTime = fields.sceneTime or sceneTime
+    end
+  elseif category == 'ai' and tostring(message):match('Vehicle controller transition') then
+    normalizedEventType = 'controller_transition'
+    local actor, oldState, newState = tostring(message):match('Vehicle controller transition ([^:]+): ([^%s]+) %-%> ([^%s]+)')
+    fields.actor = fields.actor or actor
+    fields.oldState = fields.oldState or oldState
+    fields.newState = fields.newState or newState
+    fields.sceneTime = fields.sceneTime or sceneTime
+  end
+  return normalizedEventType, fields
+end
+
 local function removeVirtualFile(path)
   if not FS or not FS.removeFile then return false end
   local ok, result = pcall(function() return FS:removeFile(path) end)
@@ -367,16 +398,75 @@ local function exportFailure(code, failedStep, virtualPath, physicalDisplayPath,
   return {ok=false, code=code, failedStep=failedStep, writeBackend='sandboxed_io_open', writePathType='virtual', virtualPath=virtualPath, physicalDisplayPath=physicalDisplayPath, message=message}
 end
 
-local function textReport(session)
+local function appendSection(lines, title, sectionLines)
+  table.insert(lines, title)
+  if sectionLines and #sectionLines > 0 then
+    for _, line in ipairs(sectionLines) do table.insert(lines, line) end
+  else
+    table.insert(lines, '(none)')
+  end
+  table.insert(lines, '')
+end
+
+local function isImportantTimelineEvent(event)
+  if not event or event.recordType ~= 'event' then return false end
+  if event.level == 'WARN' or event.level == 'ERROR' then return true end
+  if event.level ~= 'INFO' then return false end
+  local message = tostring(event.message or '')
+  local eventType = tostring(event.eventType or '')
+  if message:match('Forward neighbor') or message:match('Opposite candidate') or message:match('Queued AI') then return false end
+  if message:match('position=') and event.category == 'lifecycle' then return false end
+  if event.category == 'trigger' and (eventType == 'trigger_fired' or eventType == 'trigger_reaction_scheduled' or eventType == 'trigger_cancelled' or eventType == 'trigger_engine_armed') then return true end
+  if event.category == 'ai' and eventType == 'controller_transition' then return event.fields and event.fields.oldState ~= event.fields.newState end
+  if event.category == 'following' and (message:match('Following route initialized') or message:match('target temporarily unavailable')) then return true end
+  if message:match('Diagnostic session created') or message:match('Generating road scenario') or message:match('generated successfully') or message:match('Scenario definition .* generated') then return true end
+  if message:match('Selected straight') or message:match('opposite carriageway selected') or message:match('Ambient traffic started') or message:match('spawned') or message:match('Scenario Timeline') or message:match('Diagnostic session exported') then return true end
+  if message:match('brake') or message:match('Brake') or message:match('scheduled') or message:match('released') then return true end
+  return false
+end
+
+local function textReport(session, exportMetadata)
   local c = session.counters or {}
   local out = {'Random Incident Generator Diagnostic Session', '============================================', '1. Header', 'sessionId: ' .. tostring(session.sessionId), 'status: ' .. tostring(session.status), 'createdAt: ' .. tostring(session.createdAt), 'modVersion: ' .. tostring(session.modVersion), '', '2. Scenario', 'scenarioId: ' .. tostring(session.scenarioId), 'scenarioVersion: ' .. tostring(session.scenarioVersion), 'phase: ' .. tostring(session.phase), 'seed: ' .. tostring(session.seed), '', '3. Environment', 'map: ' .. tostring(session.mapName), 'sceneTime: ' .. tostring(session.sceneTime), '', '4. Actors'}
   for _, actor in ipairs(session.actors or {}) do table.insert(out, string.format('%s role=%s objectId=%s model=%s ambient=%s speed=%.2f lane=%s position=%s', actor.label, actor.role, tostring(actor.objectId), actor.model, tostring(actor.ambient), actor.initialSpeed, tostring(actor.lane), jsonEncode(actor.spawnPosition))) end
-  table.insert(out, ''); table.insert(out, '5. Important Timeline');
-  for _, event in ipairs(session.events or {}) do if event.level ~= 'DEBUG' then table.insert(out, string.format('[%s] t=%.3f %s/%s: %s %s', event.level, event.sceneTime or 0, event.category, event.eventType, event.message or '', jsonEncode(event.fields or {}))) end end
-  for _, section in ipairs({'6. Trigger Events', '7. Controller Transitions', '8. Warnings and Errors', '9. Last Vehicle Lua Commands', '10. Coalesced Debug Summary', '11. Counters', '12. Export Metadata'}) do table.insert(out, ''); table.insert(out, section) end
-  for _, event in ipairs(session.events or {}) do if event.recordType == 'coalescedDebug' then table.insert(out, string.format('%s/%s actor=%s count=%d first=%.3f last=%.3f firstValue=%s lastValue=%s min=%s max=%s', event.category, event.eventType, tostring(event.actor), event.count, event.firstTime or 0, event.lastTime or 0, tostring(event.firstValue), tostring(event.lastValue), tostring(event.minValue), tostring(event.maxValue))) end end
-  for actor, command in pairs(session.lastVehicleCommands or {}) do table.insert(out, string.format('%s objectId=%s context=%s sceneTime=%.3f\n%s', actor, tostring(command.objectId), command.context, command.sceneTime or 0, command.command)) end
-  table.insert(out, string.format('events=%d DEBUG=%d INFO=%d WARN=%d ERROR=%d droppedEvents=%d triggerCount=%d', #session.events, c.DEBUGCount or 0, c.INFOCount or 0, c.WARNCount or 0, c.ERRORCount or 0, c.droppedEvents or 0, c.triggerCount or 0))
+
+  local timelineLines, triggerLines, transitionLines, warningLines, commandLines, coalescedLines = {}, {}, {}, {}, {}, {}
+  for _, event in ipairs(session.events or {}) do
+    local line = string.format('[%s] t=%.3f %s/%s: %s %s', event.level, event.sceneTime or 0, event.category, event.eventType, event.message or '', jsonEncode(event.fields or {}))
+    if isImportantTimelineEvent(event) then table.insert(timelineLines, line) end
+    if event.recordType == 'event' and event.category == 'trigger' and (event.eventType == 'trigger_fired' or event.eventType == 'trigger_reaction_scheduled' or event.eventType == 'trigger_cancelled') then table.insert(triggerLines, line) end
+    if event.recordType == 'event' and event.category == 'ai' and event.eventType == 'controller_transition' and event.fields and event.fields.oldState ~= event.fields.newState then table.insert(transitionLines, line) end
+    if event.recordType == 'event' and (event.level == 'WARN' or event.level == 'ERROR') then table.insert(warningLines, line) end
+    if event.recordType == 'coalescedDebug' then table.insert(coalescedLines, string.format('%s/%s actor=%s count=%d firstTime=%.3f lastTime=%.3f firstValue=%s lastValue=%s minValue=%s maxValue=%s', event.category, event.eventType, tostring(event.actor), event.count, event.firstTime or 0, event.lastTime or 0, tostring(event.firstValue), tostring(event.lastValue), tostring(event.minValue), tostring(event.maxValue))) end
+  end
+  for actor, command in pairs(session.lastVehicleCommands or {}) do table.insert(commandLines, string.format('actor=%s objectId=%s context=%s sceneTime=%.3f\ncommand=%s', actor, tostring(command.objectId), command.context, command.sceneTime or 0, command.command)) end
+
+  table.insert(out, ''); appendSection(out, '5. Important Timeline', timelineLines)
+  appendSection(out, '6. Trigger Events', triggerLines)
+  appendSection(out, '7. Controller Transitions', transitionLines)
+  appendSection(out, '8. Warnings and Errors', warningLines)
+  appendSection(out, '9. Last Vehicle Lua Commands', commandLines)
+  appendSection(out, '10. Coalesced Debug Summary', coalescedLines)
+  local counterLines = {
+    string.format('exportedEventRecords=%d', #(session.events or {})),
+    string.format('capturedDebugObservations=%d', c.DEBUGCount or 0),
+    string.format('capturedInfoObservations=%d', c.INFOCount or 0),
+    string.format('capturedWarnObservations=%d', c.WARNCount or 0),
+    string.format('capturedErrorObservations=%d', c.ERRORCount or 0),
+    string.format('droppedEvents=%d', c.droppedEvents or 0),
+    string.format('triggerCount=%d', c.triggerCount or 0),
+  }
+  appendSection(out, '11. Counters', counterLines)
+  local exportLines = {}
+  if exportMetadata then
+    table.insert(exportLines, 'exportedAt=' .. tostring(exportMetadata.exportedAt))
+    table.insert(exportLines, 'txtPath=' .. tostring(exportMetadata.txtPath))
+    table.insert(exportLines, 'jsonlPath=' .. tostring(exportMetadata.jsonlPath))
+    table.insert(exportLines, 'writeBackend=' .. tostring(exportMetadata.writeBackend))
+    table.insert(exportLines, 'sessionId=' .. tostring(exportMetadata.sessionId))
+    table.insert(exportLines, 'formatVersion=' .. tostring(exportMetadata.formatVersion))
+  end
+  appendSection(out, '12. Export Metadata', exportLines)
   return table.concat(out, '\n') .. '\n'
 end
 
@@ -386,9 +476,10 @@ function M.exportLastSession()
   local txtPath, jsonlPath, virtualTxtPath, virtualJsonlPath = buildExportPaths(session.sessionId)
   if not txtPath then return jsonlPath end
   local virtualTxtTemp, virtualJsonlTemp = virtualTxtPath .. '.tmp', virtualJsonlPath .. '.tmp'
+  local exportMetadata = {exportedAt=os.date('!%Y-%m-%dT%H:%M:%SZ'), txtPath=txtPath, jsonlPath=jsonlPath, writeBackend='sandboxed_io_open', sessionId=session.sessionId, formatVersion='1'}
   local txt = io.open(virtualTxtTemp, 'w')
   if not txt then return exportFailure('TXT_OPEN_FAILED', 'txt_open', virtualTxtTemp, txtPath, 'Unable to open TXT export through BeamNG VFS') end
-  local txtWriteOk = pcall(function() txt:write(textReport(session)) end)
+  local txtWriteOk = pcall(function() txt:write(textReport(session, exportMetadata)) end)
   local txtCloseOk = pcall(function() txt:close() end)
   if not txtWriteOk then removeVirtualFile(virtualTxtTemp); return exportFailure('TXT_WRITE_FAILED', 'txt_write', virtualTxtTemp, txtPath, 'Unable to write TXT export through BeamNG VFS') end
   if not txtCloseOk then removeVirtualFile(virtualTxtTemp); return exportFailure('TXT_CLOSE_FAILED', 'txt_close', virtualTxtTemp, txtPath, 'Unable to close TXT export') end
@@ -427,7 +518,7 @@ function M.exportLastSession()
   end
   local jsonlFinalOk, jsonlFinalExists = pcall(function() return FS:fileExists(virtualJsonlPath) end)
   if not jsonlFinalOk or jsonlFinalExists ~= true then return exportFailure('JSONL_VERIFY_FAILED', 'jsonl_verify_final', virtualJsonlPath, jsonlPath, 'JSONL final file was not visible through BeamNG VFS') end
-  session.export = {txtPath=txtPath, jsonlPath=jsonlPath, exportedAt=os.date('!%Y-%m-%dT%H:%M:%SZ')}
+  session.export = exportMetadata
   return {ok=true, sessionId=session.sessionId, txtPath=txtPath, jsonlPath=jsonlPath, eventCount=#(session.events or {}), warningCount=session.counters.WARNCount or 0, errorCount=session.counters.ERRORCount or 0}
 end
 
