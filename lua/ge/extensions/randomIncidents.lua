@@ -1,10 +1,49 @@
-print("RANDOM INCIDENTS LUA FILE LOADED v2.3.1 - SCENARIO ENGINE V2 COMMIT 7.1 TRANSIENT BRAKING")
+print("RANDOM INCIDENTS LUA FILE LOADED v2.3.3 - SCENARIO ENGINE V2 COMMIT 7.3 DIAGNOSTIC SESSION EXPORT")
 -- Random Incident Generator - Phase 1: Spot Harvester
 -- Harvests candidate incident locations from the loaded level navgraph.
 
 local M = {}
 
 local logTag = 'randomIncidents'
+local diagnostics = require('lua/ge/extensions/randomIncidents/diagnostics')
+local function log(level, tag, message)
+  local normalized = ({D='DEBUG', I='INFO', W='WARN', E='ERROR'})[level] or tostring(level):upper()
+  local text = tostring(message or '')
+  local category = 'lifecycle'
+  if text:match('[Tt]rigger') then category = 'trigger'
+  elseif text:match('[Ff]ollow') then category = 'following'
+  elseif text:match('[Aa]mbient') then category = 'ambient'
+  elseif text:match('[Cc]ontroller') then category = 'ai'
+  elseif text:match('[Ss]pawn') or text:match('[Ss]pawned') then category = 'spawn'
+  elseif text:match('[Ee]xport') then category = 'export'
+  elseif text:match('[Gg]enerat') then category = 'scenario' end
+  local eventType = text:lower():gsub('[^%w]+', '_'):gsub('^_+', ''):sub(1, 80)
+  if text:match('Following speed sync') then eventType = 'following_speed_sync' end
+  local actor = text:match('([%w%s]+) target=') or text:match('for ([%w%s]+)')
+  local fields = actor and {actor = actor} or nil
+  if eventType == 'following_speed_sync' then
+    actor = text:match('Following speed sync (.-) target=') or actor
+    fields = {actor = actor, target = text:match('target=([^%s]+)'), speed = tonumber(text:match('speed=([%+%-]?[%d%.]+)'))}
+  end
+  diagnostics.log(normalized, category, eventType, text, fields)
+end
+local function getVehicleObjectId(vehicle)
+  local id = nil
+  if vehicle and vehicle.getID then pcall(function() id = vehicle:getID() end) end
+  return id
+end
+local function getCurrentMapName()
+  local missionFilename = nil
+  if type(getMissionFilename) == 'function' then pcall(function() missionFilename = getMissionFilename() end) end
+  local levelName = nil
+  if core_levels and core_levels.getLevelName and missionFilename then
+    pcall(function() levelName = core_levels.getLevelName(missionFilename) end)
+  end
+  if type(levelName) ~= 'string' or levelName == '' then
+    levelName = type(missionFilename) == 'string' and (missionFilename:match('^/*levels/([^/]+)/') or missionFilename:match('^[\\/]levels[\\/]([^\\/]+)[\\/]')) or nil
+  end
+  return type(levelName) == 'string' and levelName ~= '' and levelName or 'unknown'
+end
 local savedSpotsPath = '/settings/randomIncidents_spots.json'
 local spots = {}
 local generatedVehicles = {}
@@ -41,7 +80,8 @@ local vehicleControllerDefaults = {
   holdRefreshInterval = 0.50,
   reverseCorrectionMaxMps = 2.00,
   reverseLogInterval = 0.50,
-  followRefreshInterval = 0.75,
+  followingSyncInterval = 1.25,
+  followingSpeedDelta = 0.40,
 }
 
 local triggerEngine = require('lua/ge/extensions/randomIncidents/triggerEngine')
@@ -409,6 +449,51 @@ local function findGeneratedVehicleEntry(label)
   return nil
 end
 
+local function logInvalidDrivePathOnce(actorLabel, reason, nodeCount, context)
+  local sceneTime = generatedScene and generatedScene.timeline and generatedScene.timeline.elapsed or 0
+  local warningKeys = generatedScene and generatedScene.pathWarningKeys
+  if not warningKeys then
+    if generatedScene then
+      generatedScene.pathWarningKeys = {}
+      warningKeys = generatedScene.pathWarningKeys
+    else
+      warningKeys = {}
+    end
+  end
+  local key = table.concat({tostring(actorLabel), tostring(reason), tostring(context)}, '|')
+  if warningKeys[key] then return end
+  warningKeys[key] = true
+  log('W', logTag, string.format(
+    'Skipping driveUsingPath for %s: %s, got %d nodes sceneTime=%.3f context=%s',
+    tostring(actorLabel), tostring(reason), tonumber(nodeCount) or 0, tonumber(sceneTime) or 0, tostring(context)
+  ))
+end
+
+local function validateDrivePath(path, actorLabel, context)
+  if type(path) ~= 'table' then
+    logInvalidDrivePathOnce(actorLabel, 'path must be a table', 0, context)
+    return nil, false, 0
+  end
+
+  -- Build a fresh list. The caller's route is never modified while empty or
+  -- nil waypoint IDs are discarded.
+  local validNodes = {}
+  for _, nodeId in ipairs(path) do
+    if nodeId ~= nil then
+      local normalized = tostring(nodeId)
+      if normalized:match('%S') then
+        table.insert(validNodes, normalized)
+      end
+    end
+  end
+
+  if #validNodes < 2 then
+    logInvalidDrivePathOnce(actorLabel, 'path requires at least 2 nodes', #validNodes, context)
+    return validNodes, false, #validNodes
+  end
+  return validNodes, true, #validNodes
+end
+
 local function queueVehicleAI(vehicle, speed, label, targetPath, driveInLane)
   if not vehicle or not vehicle.queueLuaCommand then
     log('W', logTag, string.format('%s has no queueLuaCommand; AI was not configured', label))
@@ -419,17 +504,22 @@ local function queueVehicleAI(vehicle, speed, label, targetPath, driveInLane)
   -- road speed to win over the requested scene speed. Scripted actors keep
   -- collision avoidance disabled; ambient traffic uses a separate AI path below.
   local laneMode = driveInLane and 'on' or 'off'
-  local pathLiteral = '{}'
-  if targetPath and #targetPath > 0 then
-    local pathNodes = {}
-    for _, nodeId in ipairs(targetPath) do
-      table.insert(pathNodes, string.format('%q', tostring(nodeId)))
-    end
-    pathLiteral = '{' .. table.concat(pathNodes, ', ') .. '}'
+  local pathNodes, pathValid = validateDrivePath(targetPath, label, 'queueVehicleAI')
+  local quotedPathNodes = {}
+  for _, nodeId in ipairs(pathNodes or {}) do
+    table.insert(quotedPathNodes, string.format('%q', nodeId))
+  end
+  local pathLiteral = '{' .. table.concat(quotedPathNodes, ', ') .. '}'
+  local pathCommand = ''
+  if pathValid then
+    pathCommand = string.format(
+      "; if ai.driveUsingPath then ai.driveUsingPath{wpTargetList = %s, noOfLaps = 0, driveInLane = '%%s', avoidCars = 'off', aggression = 1, routeSpeed = %%.2f, routeSpeedMode = 'set'} end",
+      pathLiteral
+    )
   end
   local command = string.format(
-    "if input then input.event('throttle', 0, 1); input.event('brake', 0, 1); input.event('parkingbrake', 0, 1); input.event('clutch', 0, 1) end; ai.setMode('traffic'); ai.setAggression(1); ai.setSpeedMode('set'); ai.setSpeed(%.2f); ai.driveInLane('%s'); if ai.setAvoidCars then ai.setAvoidCars(false) end; if ai.driveUsingPath then ai.driveUsingPath{wpTargetList = %s, noOfLaps = 0, driveInLane = '%s', avoidCars = 'off', aggression = 1, routeSpeed = %.2f, routeSpeedMode = 'set'} end",
-    speed, laneMode, pathLiteral, laneMode, speed
+    "if input then input.event('throttle', 0, 1); input.event('brake', 0, 1); input.event('parkingbrake', 0, 1); input.event('clutch', 0, 1) end; ai.setMode('traffic'); ai.setAggression(1); ai.setSpeedMode('set'); ai.setSpeed(%.2f); ai.driveInLane('%s'); if ai.setAvoidCars then ai.setAvoidCars(false) end%s",
+    speed, laneMode, string.format(pathCommand, laneMode, speed)
   )
 
   local ok, errorMessage = pcall(function() vehicle:queueLuaCommand(command) end)
@@ -442,7 +532,29 @@ local function queueVehicleAI(vehicle, speed, label, targetPath, driveInLane)
     generatedScene.queuedAICommands = generatedScene.queuedAICommands or {}
     generatedScene.queuedAICommands[label] = command
   end
-  return ok
+  local objectId = getVehicleObjectId(vehicle)
+  diagnostics.recordCommand(label, objectId, 'queueVehicleAI', command)
+  return ok, pathValid, #((pathNodes or {}))
+end
+
+local function queueFollowingSpeedSync(entry, targetSpeed)
+  if not entry or not entry.vehicle or not entry.vehicle.queueLuaCommand then
+    return false
+  end
+  local speed = math.max(0, tonumber(targetSpeed) or 0)
+  local command = string.format("ai.setSpeedMode('set'); ai.setSpeed(%.2f)", speed)
+  local ok, errorMessage = pcall(function() entry.vehicle:queueLuaCommand(command) end)
+  if not ok then
+    log('E', logTag, string.format('Failed following speed sync for %s: %s', tostring(entry.label), tostring(errorMessage)))
+    return false
+  end
+  if generatedScene then
+    generatedScene.queuedAICommands = generatedScene.queuedAICommands or {}
+    generatedScene.queuedAICommands[entry.label .. ' followingSpeedSync'] = command
+  end
+  local objectId = getVehicleObjectId(entry.vehicle)
+  diagnostics.recordCommand(entry.label, objectId, 'following_speed_sync', command)
+  return true
 end
 
 local function queueAmbientVehicleAI(entry, targetPath)
@@ -452,20 +564,28 @@ local function queueAmbientVehicleAI(entry, targetPath)
     return false
   end
 
-  local pathNodes = {}
-  for _, nodeId in ipairs(targetPath or {}) do
-    table.insert(pathNodes, string.format('%q', tostring(nodeId)))
+  local pathNodes, pathValid = validateDrivePath(targetPath, entry and entry.label or 'ambient', 'queueAmbientVehicleAI')
+  local quotedPathNodes = {}
+  for _, nodeId in ipairs(pathNodes or {}) do
+    table.insert(quotedPathNodes, string.format('%q', nodeId))
   end
-  local pathLiteral = '{' .. table.concat(pathNodes, ', ') .. '}'
+  local pathLiteral = '{' .. table.concat(quotedPathNodes, ', ') .. '}'
   local aiConfig = entry.ai or {}
   local speed = tonumber(entry.speedMps) or 14
   local aggression = clamp(tonumber(aiConfig.aggression) or 0.35, 0, 1)
   local laneMode = aiConfig.driveInLane == false and 'off' or 'on'
   local avoidCars = aiConfig.avoidCars ~= false
   local avoidMode = avoidCars and 'on' or 'off'
+  local pathCommand = ''
+  if pathValid then
+    pathCommand = string.format(
+      "; if ai.driveUsingPath then ai.driveUsingPath{wpTargetList = %s, noOfLaps = 0, driveInLane = '%%s', avoidCars = '%%s', aggression = %%.2f, routeSpeed = %%.2f, routeSpeedMode = 'set'} end",
+      pathLiteral
+    )
+  end
   local command = string.format(
-    "if input then input.event('throttle', 0, 1); input.event('brake', 0, 1); input.event('parkingbrake', 0, 1); input.event('clutch', 0, 1) end; ai.setMode('traffic'); ai.setAggression(%.2f); ai.setSpeedMode('set'); ai.setSpeed(%.2f); ai.driveInLane('%s'); if ai.setAvoidCars then ai.setAvoidCars(%s) end; if ai.driveUsingPath then ai.driveUsingPath{wpTargetList = %s, noOfLaps = 0, driveInLane = '%s', avoidCars = '%s', aggression = %.2f, routeSpeed = %.2f, routeSpeedMode = 'set'} end",
-    aggression, speed, laneMode, tostring(avoidCars), pathLiteral, laneMode, avoidMode, aggression, speed
+    "if input then input.event('throttle', 0, 1); input.event('brake', 0, 1); input.event('parkingbrake', 0, 1); input.event('clutch', 0, 1) end; ai.setMode('traffic'); ai.setAggression(%.2f); ai.setSpeedMode('set'); ai.setSpeed(%.2f); ai.driveInLane('%s'); if ai.setAvoidCars then ai.setAvoidCars(%s) end%s",
+    aggression, speed, laneMode, tostring(avoidCars), string.format(pathCommand, laneMode, avoidMode, aggression, speed)
   )
   local ok, errorMessage = pcall(function() vehicle:queueLuaCommand(command) end)
   if ok then
@@ -480,6 +600,8 @@ local function queueAmbientVehicleAI(entry, targetPath)
     generatedScene.queuedAICommands = generatedScene.queuedAICommands or {}
     generatedScene.queuedAICommands[entry.label] = command
   end
+  local objectId = getVehicleObjectId(vehicle)
+  diagnostics.recordCommand(entry.label, objectId, 'queueAmbientVehicleAI', command)
   return ok
 end
 
@@ -509,6 +631,8 @@ local function queueVehicleBrake(vehicle, label, brakeAmount, commandName)
     generatedScene.queuedAICommands = generatedScene.queuedAICommands or {}
     generatedScene.queuedAICommands[label .. ' ' .. commandName] = command
   end
+  local objectId = getVehicleObjectId(vehicle)
+  diagnostics.recordCommand(label, objectId, commandName, command)
   return ok
 end
 
@@ -540,6 +664,8 @@ local function queueVehicleSteering(vehicle, label, steeringAmount, commandName,
     generatedScene.queuedAICommands = generatedScene.queuedAICommands or {}
     generatedScene.queuedAICommands[label .. ' ' .. commandName] = command
   end
+  local objectId = getVehicleObjectId(vehicle)
+  diagnostics.recordCommand(label, objectId, commandName, command)
   return ok
 end
 
@@ -562,6 +688,8 @@ local function queueVehicleStoppedHold(vehicle, label, reason)
     generatedScene.queuedAICommands = generatedScene.queuedAICommands or {}
     generatedScene.queuedAICommands[label .. ' stoppedHold'] = command
   end
+  local objectId = getVehicleObjectId(vehicle)
+  diagnostics.recordCommand(label, objectId, 'stopped_hold', command)
   return ok
 end
 
@@ -582,8 +710,15 @@ local function ensureVehicleController(entry, initialState)
   controller.reverseGuardCount = controller.reverseGuardCount or 0
   controller.reverseCorrectionCount = controller.reverseCorrectionCount or 0
   controller.autoStop = controller.autoStop ~= false
-  controller.followRefreshInterval = controller.followRefreshInterval or vehicleControllerDefaults.followRefreshInterval
+  controller.followingSyncInterval = controller.followingSyncInterval or vehicleControllerDefaults.followingSyncInterval
+  controller.followingSpeedDelta = controller.followingSpeedDelta or vehicleControllerDefaults.followingSpeedDelta
   controller.followRefreshElapsed = controller.followRefreshElapsed or 0
+  controller.initialized = controller.initialized == true
+  controller.lastFollowingSyncTime = controller.lastFollowingSyncTime
+  controller.lastFollowingCommandedSpeed = controller.lastFollowingCommandedSpeed
+  controller.followingRouteInitialized = controller.followingRouteInitialized == true
+  controller.followingTargetId = controller.followingTargetId
+  controller.followingTargetMissingWarning = controller.followingTargetMissingWarning == true
   return controller
 end
 
@@ -639,10 +774,15 @@ local function setVehicleControllerState(entry, newState, options)
   local oldState = controller.state
   local applied = false
 
+  if oldState == newState and controller.initialized then
+    return false
+  end
+
   if newState == VEHICLE_STATE.CRUISE or newState == VEHICLE_STATE.COASTING or newState == VEHICLE_STATE.DECELERATING or newState == VEHICLE_STATE.FOLLOWING then
     local speed = tonumber(options.speedMps) or tonumber(entry.speedMps) or 0
     local laneAware = generatedScene and generatedScene.roadRules and generatedScene.roadRules.driveInLane
-    applied = queueVehicleAI(entry.vehicle, speed, entry.label, generatedScene and generatedScene.targetPath, laneAware)
+    local pathValid, pathCount
+    applied, pathValid, pathCount = queueVehicleAI(entry.vehicle, speed, entry.label, generatedScene and generatedScene.targetPath, laneAware)
     if applied then
       entry.speedMps = speed
       controller.targetSpeedMps = speed
@@ -652,6 +792,16 @@ local function setVehicleControllerState(entry, newState, options)
       controller.followTargetLabel = newState == VEHICLE_STATE.FOLLOWING and options.followTarget or nil
       controller.followSpeedOffsetMps = newState == VEHICLE_STATE.FOLLOWING and (tonumber(options.speedOffsetMps) or 0) or 0
       controller.followRefreshElapsed = 0
+      controller.followingRouteInitialized = newState == VEHICLE_STATE.FOLLOWING and pathValid == true or false
+      controller.followingTargetId = newState == VEHICLE_STATE.FOLLOWING and options.followTarget or nil
+      controller.lastFollowingSyncTime = newState == VEHICLE_STATE.FOLLOWING and (generatedScene and generatedScene.timeline and generatedScene.timeline.elapsed or 0) or nil
+      controller.lastFollowingCommandedSpeed = newState == VEHICLE_STATE.FOLLOWING and speed or nil
+      controller.followingTargetMissingWarning = false
+      if newState == VEHICLE_STATE.FOLLOWING and pathValid == true then
+        log('I', logTag, string.format(
+          'Following route initialized for %s nodes=%d', tostring(entry.label), tonumber(pathCount) or 0
+        ))
+      end
     end
   elseif newState == VEHICLE_STATE.BRAKING or newState == VEHICLE_STATE.EMERGENCY_BRAKING then
     local brakeAmount = clamp(tonumber(options.brakeAmount) or 1, 0, 1)
@@ -676,6 +826,7 @@ local function setVehicleControllerState(entry, newState, options)
   end
 
   if applied then
+    controller.initialized = true
     controller.previousState = oldState
     controller.state = newState
     controller.stateChangedAt = generatedScene and generatedScene.timeline and generatedScene.timeline.elapsed or 0
@@ -712,18 +863,34 @@ local function updateVehicleControllers(delta, direction)
       end
     elseif controller.state == VEHICLE_STATE.FOLLOWING then
       controller.followRefreshElapsed = controller.followRefreshElapsed + delta
-      if controller.followTargetLabel and controller.followRefreshElapsed >= controller.followRefreshInterval then
+      if controller.followTargetLabel and controller.followRefreshElapsed >= controller.followingSyncInterval then
         local targetEntry = findGeneratedVehicleEntry(controller.followTargetLabel)
         local targetSpeed = targetEntry and getVehicleLongitudinalSpeed(targetEntry, direction) or nil
         if targetSpeed and targetSpeed >= 0 then
           local desiredSpeed = math.max(0, targetSpeed + (controller.followSpeedOffsetMps or 0))
-          if math.abs(desiredSpeed - (controller.targetSpeedMps or desiredSpeed)) >= 0.25 then
-            setVehicleControllerState(entry, VEHICLE_STATE.FOLLOWING, {
-              speedMps = desiredSpeed,
-              followTarget = controller.followTargetLabel,
-              speedOffsetMps = controller.followSpeedOffsetMps,
-            })
+          local sceneTime = generatedScene and generatedScene.timeline and generatedScene.timeline.elapsed or 0
+          local elapsedSinceSync = sceneTime - (controller.lastFollowingSyncTime or -math.huge)
+          local speedDelta = math.abs(desiredSpeed - (controller.lastFollowingCommandedSpeed or desiredSpeed))
+          local shouldSync = controller.lastFollowingCommandedSpeed == nil or
+            elapsedSinceSync >= controller.followingSyncInterval or
+            (speedDelta >= controller.followingSpeedDelta and elapsedSinceSync >= controller.followingSyncInterval)
+          if shouldSync and queueFollowingSpeedSync(entry, desiredSpeed) then
+            controller.lastFollowingSyncTime = sceneTime
+            controller.lastFollowingCommandedSpeed = desiredSpeed
+            controller.targetSpeedMps = desiredSpeed
+            entry.speedMps = desiredSpeed
+            log('D', logTag, string.format(
+              'Following speed sync %s target=%s speed=%.2f',
+              tostring(entry.label), tostring(controller.followTargetLabel), desiredSpeed
+            ))
           end
+        elseif not controller.followingTargetMissingWarning then
+          controller.followingTargetMissingWarning = true
+          log('W', logTag, string.format(
+            'Following target unavailable for %s target=%s; preserving current route and speed sceneTime=%.3f',
+            tostring(entry.label), tostring(controller.followTargetLabel),
+            tonumber(generatedScene and generatedScene.timeline and generatedScene.timeline.elapsed or 0) or 0
+          ))
         end
         controller.followRefreshElapsed = 0
       end
@@ -1214,7 +1381,7 @@ local function logOppositeCandidateDiagnostics(diagnostics)
   local limit = math.min(5, #candidates)
   for index = 1, limit do
     local item = candidates[index]
-    log(item.accepted and 'I' or 'W', logTag, string.format(
+    log(item.accepted and 'I' or 'D', logTag, string.format(
       'Opposite candidate rank=%d nodes=%s<->%s accepted=%s reason=%s score=%.2f edgeLength=%.2f lateral=%.2f longitudinal=%.2f vertical=%.2f directionDot=%.3f drivability=%.2f oneWay=%s',
       index, tostring(item.nodeA), tostring(item.nodeB), tostring(item.accepted), diagnosticReasonText(item),
       tonumber(item.score) or math.huge, tonumber(item.edgeLength) or 0, tonumber(item.lateralSeparation) or 0,
@@ -1788,6 +1955,7 @@ function M.generateRearEnd(seed)
 end
 
 local function generateScenarioFromActiveDefinition(seed, travelDirectionOverride)
+  diagnostics.setStatus('GENERATING')
   log('I', logTag, string.format(
     'Generating road scenario preset=%s phase=%s seed=%s directionOverride=%s',
     activeScenarioDefinition.name, activeScenarioDefinition.phase, tostring(seed), tostring(travelDirectionOverride)
@@ -2046,6 +2214,7 @@ local function generateScenarioFromActiveDefinition(seed, travelDirectionOverrid
   generatedVehicles = spawnedEntries
   generatedScene = {
     scenarioId = activeScenarioDefinition.id,
+    mapName = getCurrentMapName(),
     scenarioVersion = activeScenarioDefinition.version,
     scenarioDefinition = scenarioRegistry.copy(activeScenarioDefinition),
     preset = activeScenarioDefinition.name,
@@ -2107,6 +2276,7 @@ local function generateScenarioFromActiveDefinition(seed, travelDirectionOverrid
     },
     queuedAICommands = {},
   }
+  for _, entry in ipairs(generatedVehicles) do diagnostics.registerActor(entry) end
 
   log('I', logTag, string.format(
     'Scenario definition %s v%s generated: actors=%d ambient=%d vehicles=%d spot=%s length=%.2f trafficSide=%s oneWay=%s roadDir=%d lane=%d/%d initialHazardGap=%.2f hazardSpeed=%.2f expectedLeadTrigger=%.2fs targetPathNodes=%d; call start()',
@@ -2183,14 +2353,19 @@ function M.printScenarioDefinition(scenarioId)
 end
 
 function M.generateScenario(scenarioId, seed, travelDirectionOverride)
+  diagnostics.beginSession({scenarioId = scenarioId or DEFAULT_SCENARIO_ID, seed = seed, mapName = getCurrentMapName(), scenarioVersion = activeScenarioDefinition and activeScenarioDefinition.version, phase = activeScenarioDefinition and activeScenarioDefinition.phase})
   local definition, errorMessage = scenarioRegistry.get(scenarioId or DEFAULT_SCENARIO_ID)
   if not definition then
     log('E', logTag, string.format('Cannot generate unknown scenario %s: %s', tostring(scenarioId), tostring(errorMessage)))
+    diagnostics.setStatus('FAILED')
     return nil
   end
 
   activeScenarioDefinition = definition
-  return generateScenarioFromActiveDefinition(seed, travelDirectionOverride)
+  diagnostics.updateMetadata({scenarioId = definition.id, scenarioVersion = definition.version, phase = definition.phase})
+  local result = generateScenarioFromActiveDefinition(seed, travelDirectionOverride)
+  if result then diagnostics.setStatus('GENERATED') else diagnostics.setStatus('FAILED') end
+  return result
 end
 
 function M.generateShortsPileup(seed, travelDirectionOverride)
@@ -2400,6 +2575,7 @@ end
 local function applyTriggerEventToTimeline(event)
   if not event or not generatedScene or not generatedScene.timeline then return end
   local timeline = generatedScene.timeline
+  diagnostics.recordTrigger()
   if event.phase then timeline.phase = event.phase end
   if event.legacyFlag then timeline[event.legacyFlag] = true end
   if event.legacyTimestamp then timeline[event.legacyTimestamp] = event.firedAt end
@@ -2475,6 +2651,7 @@ local function fireScenarioTrigger(triggerId, source)
 end
 
 function M.start()
+  diagnostics.setStatus('RUNNING')
   log('I', logTag, string.format('Starting generated vehicle AI movement for %d vehicles', #generatedVehicles))
   local ambientStarted = 0
   for _, entry in ipairs(generatedVehicles) do
@@ -2821,6 +2998,7 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
   local delta = tonumber(dtSim) or tonumber(dtReal) or tonumber(dtRaw) or 0
   if delta <= 0 then return end
   timeline.elapsed = (timeline.elapsed or 0) + delta
+  diagnostics.setSceneTime(timeline.elapsed)
 
   local direction = generatedScene.dir and vec3(generatedScene.dir.x, generatedScene.dir.y, generatedScene.dir.z) or nil
   updateVehicleControllers(delta, direction)
@@ -2848,6 +3026,7 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     timeline.completed = true
     timeline.completedAt = timeline.elapsed
     timeline.phase = 'complete'
+    diagnostics.setStatus('COMPLETED')
     log('I', logTag, string.format(
       'Scenario Timeline v2 reached nominal duration %.2fs; leadBrake=%s targetBrake=%s leadHazardGap=%s targetLeadGap=%s triggerEvents=%d',
       timeline.elapsed, tostring(timeline.leadBrakeTriggered), tostring(timeline.targetBrakeTriggered),
@@ -2868,6 +3047,7 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
 end
 
 function M.reset()
+  diagnostics.setStatus('RESET')
   log('I', logTag, 'Resetting generated vehicles to initial positions')
   for _, entry in ipairs(generatedVehicles) do
     local vehicle = entry.vehicle
@@ -2886,12 +3066,18 @@ function M.reset()
       local controller = ensureVehicleController(entry, entry.role == 'stopped_hazard' and VEHICLE_STATE.STOPPED or VEHICLE_STATE.CRUISE)
       controller.state = entry.role == 'stopped_hazard' and VEHICLE_STATE.STOPPED or VEHICLE_STATE.CRUISE
       controller.previousState = nil
+      controller.initialized = false
       controller.brakeAmount = 0
       controller.holdRefreshElapsed = 0
       controller.reverseGuardCount = 0
       controller.autoStop = true
       controller.followTargetLabel = nil
       controller.followRefreshElapsed = 0
+      controller.lastFollowingSyncTime = nil
+      controller.lastFollowingCommandedSpeed = nil
+      controller.followingRouteInitialized = false
+      controller.followingTargetId = nil
+      controller.followingTargetMissingWarning = false
       log('I', logTag, string.format('Reset %s result=%s controllerState=%s', entry.label, tostring(ok), controller.state))
     end
   end
@@ -2906,6 +3092,8 @@ function M.repeatScene()
   end
 
   local scene = generatedScene
+  local parentSessionId = diagnostics.getCurrentSessionId()
+  diagnostics.beginSession({scenarioId = scene.scenarioId, seed = scene.seed, mapName = scene.mapName or getCurrentMapName(), scenarioVersion = scene.scenarioVersion, phase = scene.phase}, parentSessionId, true)
   local oldVehicleIds = {}
   for _, entry in ipairs(generatedVehicles) do
     local id = '?'
@@ -3006,6 +3194,7 @@ function M.repeatScene()
   generatedVehicles = respawnedEntries
   generatedScene = scene
   generatedScene.queuedAICommands = {}
+  for _, entry in ipairs(generatedVehicles) do diagnostics.registerActor(entry) end
   log('I', logTag, string.format('New vehicle IDs spawned: %s', table.concat(newVehicleIds, ', ')))
 
   log('I', logTag, 'Repeat step 3/3: reapplying AI and starting the same scene')
@@ -3152,6 +3341,27 @@ function M.printSceneSummary()
   end
   return scene
 end
+
+function M.setConsoleLogLevel(level) return diagnostics.setConsoleLogLevel(level) end
+function M.getConsoleLogLevel() return diagnostics.getConsoleLogLevel() end
+function M.setDiagnosticCaptureLevel(level) return diagnostics.setDiagnosticCaptureLevel(level) end
+function M.getDiagnosticCaptureLevel() return diagnostics.getDiagnosticCaptureLevel() end
+function M.exportLastSessionLog()
+  local result = diagnostics.exportLastSession()
+  if result.ok then log('I', logTag, 'Diagnostic session exported: ' .. tostring(result.txtPath)) else log('E', logTag, 'Diagnostic session export failed: ' .. tostring(result.message)) end
+  return result
+end
+function M.testDiagnosticExportPath() return diagnostics.testDiagnosticExportPath() end
+function M.exportCurrentSessionLog() return diagnostics.exportLastSession() end
+function M.getLastSessionReport() return diagnostics.getLastSessionReport() end
+function M.printLastSessionSummary() return diagnostics.printSummary() end
+function M.clearDiagnosticHistory() diagnostics.clearHistory(); return true end
+function M.onExtensionUnloaded()
+  if #generatedVehicles > 0 then M.clearGeneratedVehicles() end
+  diagnostics.setStatus('UNLOADED')
+  diagnostics.finish('UNLOADED')
+end
+M.onUnload = M.onExtensionUnloaded
 
 -- Keep the public spot-query API explicitly exported before returning the module.
 M.countSpotsByType = M.countSpotsByType

@@ -1,11 +1,11 @@
--- Natural slow-traffic pileup for Scenario Engine v2, Commit 7.1.
+-- Natural slow-traffic pileup for Scenario Engine v2, Commit 7.3.
 -- Final lead and follower braking are transient pulses. Car A returns to a
 -- FOLLOWING state behind moving Car F instead of stopping on an open road.
 return {
   id = 'sudden_obstacle_pileup',
-  version = 10,
+  version = 12,
   name = 'natural_slow_traffic_pileup_v2_1',
-  phase = 'scenario_engine_v2_commit7_1_transient_braking',
+  phase = 'scenario_engine_v2_commit7_3_diagnostic_session_export',
   description = 'Progressive lead deceleration, transient braking pulses, following a moving slow vehicle, delayed close follower response, and ambient traffic.',
 
   preferredStraightLengths = {420, 380, 340, 300},
