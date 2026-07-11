@@ -36,7 +36,7 @@ local function copy(value, depth, seen)
   seen[value] = true
   local result = {}
   for key, item in pairs(value) do
-    local safeKey = type(key) == 'string' and key or tostring(key)
+    local safeKey = (type(key) == 'string' or type(key) == 'number') and key or tostring(key)
     result[safeKey] = copy(item, depth + 1, seen)
   end
   seen[value] = nil
@@ -180,20 +180,55 @@ function M.recordTrigger() if current then current.counters.triggerCount = (curr
 function M.finish(status) if current then archive(status or current.status) end end
 
 local function getSession() return current or lastSession end
+local function getOrderedRecords(source)
+  local result = {}
+  source = type(source) == 'table' and source or {}
+  for index = 1, #source do
+    if source[index] ~= nil then table.insert(result, copy(source[index], 0)) end
+  end
+  if #result == 0 and next(source) ~= nil then
+    local entries = {}
+    for key, value in pairs(source) do table.insert(entries, {key=key, value=value}) end
+    table.sort(entries, function(a, b) return tostring(a.key) < tostring(b.key) end)
+    for _, entry in ipairs(entries) do table.insert(result, copy(entry.value, 0)) end
+  end
+  return result
+end
+
+local function getOrderedEventRecords(session)
+  return getOrderedRecords(session and session.events)
+end
+
+local function getOrderedActorRecords(session)
+  return getOrderedRecords(session and session.actors)
+end
+
+local function getCoalescedRecords(session)
+  local result = {}
+  for _, record in pairs((session and session._coalesced) or {}) do table.insert(result, copy(record, 0)) end
+  table.sort(result, function(a, b)
+    local left = tostring(a.category) .. ':' .. tostring(a.eventType) .. ':' .. tostring(a.actor)
+    local right = tostring(b.category) .. ':' .. tostring(b.eventType) .. ':' .. tostring(b.actor)
+    return left < right
+  end)
+  return result
+end
+
 function M.getSessionSnapshot(session)
   if type(session) ~= 'table' then return nil end
   local snapshot = copy(session, 0)
-  snapshot.events = copy(session.events or {}, 0)
-  snapshot.actors = copy(session.actors or {}, 0)
+  snapshot.events = getOrderedEventRecords(session)
+  snapshot.actors = getOrderedActorRecords(session)
   snapshot.lastVehicleCommands = copy(session.lastVehicleCommands or {}, 0)
   snapshot.counters = copy(session.counters or {}, 0)
   snapshot._coalesced = copy(session._coalesced or {}, 0)
+  snapshot._coalescedRecords = getCoalescedRecords(session)
   snapshot.export = copy(session.export or {}, 0)
   return snapshot
 end
 function M.getLastSessionReport()
   local session = getSession(); if not session then return nil end
-  local result = M.getSessionSnapshot(session); result._coalesced = nil; return result
+  local result = M.getSessionSnapshot(session); result._coalesced = nil; result._coalescedRecords = nil; return result
 end
 
 local function normalizeFsPath(path)
@@ -448,8 +483,8 @@ local function textReport(session, exportMetadata)
     if event.recordType == 'event' and event.category == 'trigger' and (event.eventType == 'trigger_fired' or event.eventType == 'trigger_reaction_scheduled' or event.eventType == 'trigger_cancelled') then table.insert(triggerLines, line) end
     if event.recordType == 'event' and event.category == 'ai' and event.eventType == 'controller_transition' and event.fields and event.fields.oldState ~= event.fields.newState then table.insert(transitionLines, line) end
     if event.recordType == 'event' and (event.level == 'WARN' or event.level == 'ERROR') then table.insert(warningLines, line) end
-    if event.recordType == 'coalescedDebug' then table.insert(coalescedLines, string.format('%s/%s actor=%s count=%d firstTime=%.3f lastTime=%.3f firstValue=%s lastValue=%s minValue=%s maxValue=%s', event.category, event.eventType, tostring(event.actor), event.count, event.firstTime or 0, event.lastTime or 0, tostring(event.firstValue), tostring(event.lastValue), tostring(event.minValue), tostring(event.maxValue))) end
   end
+  for _, event in ipairs(session._coalescedRecords or {}) do table.insert(coalescedLines, string.format('%s/%s actor=%s count=%d firstTime=%.3f lastTime=%.3f firstValue=%s lastValue=%s minValue=%s maxValue=%s', event.category, event.eventType, tostring(event.actor), event.count, event.firstTime or 0, event.lastTime or 0, tostring(event.firstValue), tostring(event.lastValue), tostring(event.minValue), tostring(event.maxValue))) end
   for actor, command in pairs(session.lastVehicleCommands or {}) do table.insert(commandLines, string.format('actor=%s objectId=%s context=%s sceneTime=%.3f\ncommand=%s', actor, tostring(command.objectId), command.context, command.sceneTime or 0, command.command)) end
 
   table.insert(out, ''); appendSection(out, '5. Important Timeline', timelineLines)
@@ -486,6 +521,21 @@ function M.exportLastSession()
   local liveSession = lastSession or current
   if not liveSession then return {ok=false, code='NO_SESSION', message='No diagnostic session is available'} end
   local snapshot = M.getSessionSnapshot(liveSession)
+  local snapshotDiagnostics = {
+    liveCapturedInfo = tonumber(liveSession.counters and liveSession.counters.INFOCount) or 0,
+    liveCapturedDebug = tonumber(liveSession.counters and liveSession.counters.DEBUGCount) or 0,
+    extractedEventCount = #(snapshot.events or {}),
+    extractedActorCount = #(snapshot.actors or {}),
+    extractedCoalescedCount = #(snapshot._coalescedRecords or {}),
+    extractedCommandCount = 0,
+  }
+  for _ in pairs(snapshot.lastVehicleCommands or {}) do snapshotDiagnostics.extractedCommandCount = snapshotDiagnostics.extractedCommandCount + 1 end
+  if snapshotDiagnostics.liveCapturedInfo > 0 and snapshotDiagnostics.extractedEventCount == 0 then
+    return {ok=false, code='SNAPSHOT_INVARIANT_FAILED', failedStep='extract_events', liveCapturedInfo=snapshotDiagnostics.liveCapturedInfo, extractedEventCount=snapshotDiagnostics.extractedEventCount, message='Live diagnostic observations exist but no event records were extracted'}
+  end
+  if #(getOrderedActorRecords(liveSession) or {}) > 0 and snapshotDiagnostics.extractedActorCount == 0 then
+    return {ok=false, code='SNAPSHOT_INVARIANT_FAILED', failedStep='extract_actors', liveActorCount=#(getOrderedActorRecords(liveSession) or {}), extractedActorCount=snapshotDiagnostics.extractedActorCount, message='Live actors exist but no actor records were extracted'}
+  end
   local txtPath, jsonlPath, virtualTxtPath, virtualJsonlPath = buildExportPaths(snapshot.sessionId)
   if not txtPath then return jsonlPath end
   local virtualTxtTemp, virtualJsonlTemp = virtualTxtPath .. '.tmp', virtualJsonlPath .. '.tmp'
@@ -501,7 +551,7 @@ function M.exportLastSession()
 
   local jsonl = io.open(virtualJsonlTemp, 'w')
   if not jsonl then removeVirtualFile(virtualTxtTemp); return exportFailure('JSONL_OPEN_FAILED', 'jsonl_open', virtualJsonlTemp, jsonlPath, 'Unable to open JSONL export through BeamNG VFS') end
-  local safe = copy(snapshot, 0); safe.events = nil; safe._coalesced = nil; safe.recordType = 'session'
+  local safe = copy(snapshot, 0); safe.events = nil; safe._coalesced = nil; safe._coalescedRecords = nil; safe.recordType = 'session'
   local jsonlWriteOk = pcall(function()
     jsonl:write(jsonEncode(safe) .. '\n')
     for _, event in ipairs(snapshot.events or {}) do local eventRecord = copy(event, 0); eventRecord.recordType = 'event'; jsonl:write(jsonEncode(eventRecord) .. '\n') end
@@ -532,7 +582,7 @@ function M.exportLastSession()
   local jsonlFinalOk, jsonlFinalExists = pcall(function() return FS:fileExists(virtualJsonlPath) end)
   if not jsonlFinalOk or jsonlFinalExists ~= true then return exportFailure('JSONL_VERIFY_FAILED', 'jsonl_verify_final', virtualJsonlPath, jsonlPath, 'JSONL final file was not visible through BeamNG VFS') end
   liveSession.export = copy(exportMetadata, 0)
-  return {ok=true, sessionId=snapshot.sessionId, txtPath=txtPath, jsonlPath=jsonlPath, eventCount=#(snapshot.events or {}), warningCount=snapshot.counters.WARNCount or 0, errorCount=snapshot.counters.ERRORCount or 0}
+  return {ok=true, sessionId=snapshot.sessionId, txtPath=txtPath, jsonlPath=jsonlPath, eventCount=#(snapshot.events or {}), warningCount=snapshot.counters.WARNCount or 0, errorCount=snapshot.counters.ERRORCount or 0, snapshotDiagnostics=snapshotDiagnostics}
 end
 
 function M.printSummary()
