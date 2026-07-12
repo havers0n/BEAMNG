@@ -18,46 +18,58 @@ local function copy(v, seen)
   local r = {}; for k, x in pairs(v) do if type(k) == 'string' or type(k) == 'number' then r[k] = copy(x, seen) end end; seen[v] = nil
   return r
 end
-local function vector(v, session)
-  if type(v) ~= 'table' and type(v) ~= 'userdata' then return nil end
-  local ok, x, y, z = pcall(function() return v.x, v.y, v.z end)
-  if not ok or not finite(x) or not finite(y) or not finite(z) then if v ~= nil then session.invalidFieldCount = session.invalidFieldCount + 1 end; return nil end
-  return {x=x, y=y, z=z}
-end
-local function length(v) return v and math.sqrt(v.x*v.x + v.y*v.y + v.z*v.z) or nil end
 local function emit(s, level, eventType, message, fields)
   if s.diagnostics and s.diagnostics.log then pcall(s.diagnostics.log, level, 'collision', eventType, message, fields) end
 end
-local function objectFor(s, id)
-  if s.objectProvider then local ok, value = pcall(s.objectProvider, id); if ok then return value end end
-  if be and be.getObjectByID then local ok, value = pcall(function() return be:getObjectByID(id) end); if ok then return value end end
-  return nil
+local function recordLiveFailure(s, actor, objectId, stage, message)
+  message=tostring(message or stage):gsub('[\r\n]', ' '):sub(1, 240)
+  s.lastLiveReadFailureStage, s.lastLiveReadFailureMessage=stage, message
+  s.lastLiveReadFailureObjectId, s.lastLiveReadFailureActor, s.lastLiveReadFailureSceneTime=objectId, actor, s.sceneTime
+  if not s.loggedFailureStages[stage] then
+    s.loggedFailureStages[stage]=true
+    emit(s,'WARN','collision_live_state_read_failed','Live collision state read failed',{stage=stage,actor=actor,objectId=objectId,message=message})
+  end
+end
+local function vector(v, session, actor, objectId, stage)
+  if v == nil then return nil end
+  -- BeamNG vec3 can be userdata/cdata; access must not be restricted by Lua
+  -- type. Runtime telemetry uses the same x/y/z access pattern.
+  local ok, x, y, z = pcall(function() return v.x or v[1], v.y or v[2], v.z or v[3] end)
+  if not ok or not finite(x) or not finite(y) or not finite(z) then
+    session.invalidFieldCount = session.invalidFieldCount + 1
+    if stage then session.liveVectorSanitizeFailureCount=session.liveVectorSanitizeFailureCount+1; recordLiveFailure(session,actor,objectId,stage,'vector components are missing or non-finite') end
+    return nil
+  end
+  return {x=x,y=y,z=z}
+end
+local function length(v) return v and math.sqrt(v.x*v.x + v.y*v.y + v.z*v.z) or nil end
+local function getLiveVehicleObject(s, objectId, actor)
+  s.liveObjectLookupCount=s.liveObjectLookupCount+1
+  if not finite(objectId) or objectId % 1 ~= 0 then recordLiveFailure(s,actor,objectId,'invalid_object_id','objectId must be a finite integer'); return nil end
+  local ok, vehicle
+  if s.objectProvider then ok,vehicle=pcall(s.objectProvider,objectId)
+  elseif be and be.getObjectByID then ok,vehicle=pcall(function() return be:getObjectByID(objectId) end)
+  else ok,vehicle=true,nil end
+  if not ok then s.liveObjectLookupErrorCount=s.liveObjectLookupErrorCount+1;recordLiveFailure(s,actor,objectId,'object_lookup_error',tostring(vehicle));return nil end
+  if not vehicle then s.liveObjectNotFoundCount=s.liveObjectNotFoundCount+1;recordLiveFailure(s,actor,objectId,'object_not_found','be:getObjectByID returned nil');return nil end
+  return vehicle
 end
 -- All getters are isolated so one transient BeamNG object failure never loses
 -- another current field. This reader never sends commands to Vehicle Lua.
 local function readLiveActorState(s, actorRecord)
   s.liveStateReadCount = s.liveStateReadCount + 1
-  if s.liveStateReader then
-    local ok, state = pcall(s.liveStateReader, actorRecord)
-    if ok and type(state) == 'table' then
-      local position, velocity, forward = vector(state.position, s), vector(state.velocity, s), vector(state.forward, s)
-      if position or velocity then return {exists=state.exists ~= false,position=position,velocity=velocity,forward=forward,speedMps=length(velocity),source='live_vehicle'} end
-    end
-    s.liveStateReadFailureCount=s.liveStateReadFailureCount+1
-    return {exists=false,source='partial'}
-  end
-  local vehicle = objectFor(s, actorRecord.objectId)
+  local vehicle = getLiveVehicleObject(s, actorRecord.objectId, actorRecord.actor)
   if not vehicle then s.liveStateReadFailureCount=s.liveStateReadFailureCount+1; return {exists=false,source='partial'} end
   local position, velocity, forward = nil, nil, nil
-  if vehicle.getPosition then local ok, value=pcall(function() return vehicle:getPosition() end); if ok then position=vector(value,s) end end
-  if vehicle.getVelocity then local ok, value=pcall(function() return vehicle:getVelocity() end); if ok then velocity=vector(value,s) end end
-  if vehicle.getDirectionVector then local ok, value=pcall(function() return vehicle:getDirectionVector() end); if ok then forward=vector(value,s) end end
+  if type(vehicle.getPosition) ~= 'function' then s.livePositionReadFailureCount=s.livePositionReadFailureCount+1;recordLiveFailure(s,actorRecord.actor,actorRecord.objectId,'position_getter_missing','getPosition is unavailable') else s.livePositionReadCount=s.livePositionReadCount+1;local ok,value=pcall(function() return vehicle:getPosition() end);if not ok then s.livePositionReadFailureCount=s.livePositionReadFailureCount+1;recordLiveFailure(s,actorRecord.actor,actorRecord.objectId,'position_read_error',tostring(value)) else position=vector(value,s,actorRecord.actor,actorRecord.objectId,'position_invalid');if not position then s.livePositionReadFailureCount=s.livePositionReadFailureCount+1 end end end
+  if type(vehicle.getVelocity) ~= 'function' then s.liveVelocityReadFailureCount=s.liveVelocityReadFailureCount+1;recordLiveFailure(s,actorRecord.actor,actorRecord.objectId,'velocity_getter_missing','getVelocity is unavailable') else s.liveVelocityReadCount=s.liveVelocityReadCount+1;local ok,value=pcall(function() return vehicle:getVelocity() end);if not ok then s.liveVelocityReadFailureCount=s.liveVelocityReadFailureCount+1;recordLiveFailure(s,actorRecord.actor,actorRecord.objectId,'velocity_read_error',tostring(value)) else velocity=vector(value,s,actorRecord.actor,actorRecord.objectId,'velocity_invalid');if not velocity then s.liveVelocityReadFailureCount=s.liveVelocityReadFailureCount+1 end end end
+  if type(vehicle.getDirectionVector) ~= 'function' then s.liveForwardReadFailureCount=s.liveForwardReadFailureCount+1;recordLiveFailure(s,actorRecord.actor,actorRecord.objectId,'forward_getter_missing','getDirectionVector is unavailable') else s.liveForwardReadCount=s.liveForwardReadCount+1;local ok,value=pcall(function() return vehicle:getDirectionVector() end);if not ok then s.liveForwardReadFailureCount=s.liveForwardReadFailureCount+1;recordLiveFailure(s,actorRecord.actor,actorRecord.objectId,'forward_read_error',tostring(value)) else forward=vector(value,s,actorRecord.actor,actorRecord.objectId,'forward_invalid');if not forward then s.liveForwardReadFailureCount=s.liveForwardReadFailureCount+1 end end end
   if not position and not velocity then s.liveStateReadFailureCount=s.liveStateReadFailureCount+1 end
   return {exists=true,position=position,velocity=velocity,forward=forward,speedMps=length(velocity),source=(position and velocity) and 'live_vehicle' or 'partial'}
 end
 local function resolveCollisionActorState(s, actorRecord, telemetryAccessor)
   local live = readLiveActorState(s, actorRecord)
-  local latest = telemetryAccessor and telemetryAccessor.latestByActor and telemetryAccessor.latestByActor[actorRecord.actor]
+  local latest = telemetryAccessor and telemetryAccessor.sessionId == s.sessionId and telemetryAccessor.latestByActor and telemetryAccessor.latestByActor[actorRecord.actor]
   -- Do not use a stale actor record when a repeat has assigned a new object ID.
   if latest and tonumber(latest.objectId) ~= tonumber(actorRecord.objectId) then latest=nil end
   local position, velocity, forward = live.position, live.velocity, live.forward
@@ -67,6 +79,7 @@ local function resolveCollisionActorState(s, actorRecord, telemetryAccessor)
     if not velocity then velocity=vector(latest.velocity,s); usedFallback=velocity ~= nil end
     if not forward then forward=vector(latest.forward,s) end
   end
+  if (not position or not velocity) and (not latest or not position or not velocity) then recordLiveFailure(s,actorRecord.actor,actorRecord.objectId,'telemetry_fallback_missing','latest telemetry state is unavailable or does not match this session/object') end
   local source
   if live.position and live.velocity then source='live_vehicle'
   elseif not live.position and not live.velocity and position and velocity then source='runtime_telemetry'
@@ -183,12 +196,12 @@ local function snapshot(s)
   if not s then return nil end
   local events=copy(s.events); local active,ended=0,0; for _,e in ipairs(events) do if e.state=='ACTIVE' then active=active+1 else ended=ended+1 end end
   return {sessionId=s.sessionId,scenarioId=s.scenarioId,seed=s.seed,status=s.status,startedAtSceneTime=s.startedAtSceneTime,stoppedAtSceneTime=s.stoppedAtSceneTime,pollInterval=s.pollInterval,actorCount=#s.actors,
-    collisionEventCount=#events,activeCollisionCount=active,endedCollisionCount=ended,rawObservationCount=s.rawObservationCount,duplicateObservationCount=s.duplicateObservationCount,ignoredUnknownObjectCount=s.ignoredUnknownObjectCount,unpairedCrashSignalCount=s.unpairedCrashSignalCount,droppedCollisionEventCount=s.droppedCollisionEventCount,invalidFieldCount=s.invalidFieldCount,liveStateReadCount=s.liveStateReadCount,liveStateReadFailureCount=s.liveStateReadFailureCount,telemetryFallbackCount=s.telemetryFallbackCount,partialStateCount=s.partialStateCount,sourceStatus=copy(s.sourceStatus),events=events}
+    collisionEventCount=#events,activeCollisionCount=active,endedCollisionCount=ended,rawObservationCount=s.rawObservationCount,duplicateObservationCount=s.duplicateObservationCount,ignoredUnknownObjectCount=s.ignoredUnknownObjectCount,unpairedCrashSignalCount=s.unpairedCrashSignalCount,droppedCollisionEventCount=s.droppedCollisionEventCount,invalidFieldCount=s.invalidFieldCount,liveStateReadCount=s.liveStateReadCount,liveStateReadFailureCount=s.liveStateReadFailureCount,telemetryFallbackCount=s.telemetryFallbackCount,partialStateCount=s.partialStateCount,liveObjectLookupCount=s.liveObjectLookupCount,liveObjectNotFoundCount=s.liveObjectNotFoundCount,liveObjectLookupErrorCount=s.liveObjectLookupErrorCount,livePositionReadCount=s.livePositionReadCount,livePositionReadFailureCount=s.livePositionReadFailureCount,liveVelocityReadCount=s.liveVelocityReadCount,liveVelocityReadFailureCount=s.liveVelocityReadFailureCount,liveForwardReadCount=s.liveForwardReadCount,liveForwardReadFailureCount=s.liveForwardReadFailureCount,liveVectorSanitizeFailureCount=s.liveVectorSanitizeFailureCount,lastLiveReadFailureStage=s.lastLiveReadFailureStage,lastLiveReadFailureMessage=s.lastLiveReadFailureMessage,lastLiveReadFailureObjectId=s.lastLiveReadFailureObjectId,lastLiveReadFailureActor=s.lastLiveReadFailureActor,lastLiveReadFailureSceneTime=s.lastLiveReadFailureSceneTime,sourceStatus=copy(s.sourceStatus),events=events}
 end
 function M.startSession(config)
   if current then M.stopSession('replaced') end; config=type(config)=='table' and config or {}
   local actors, byId={},{}; for _,x in ipairs(config.actors or {}) do local id=tonumber(x.objectId); if id and not byId[id] then local a={actor=tostring(x.actor or x.label or ''),objectId=id,role=tostring(x.role or ''),ambient=x.ambient==true}; actors[#actors+1]=a;byId[id]=a end end
-  current={sessionId=tostring(config.sessionId or ''),scenarioId=config.scenarioId,seed=config.seed,status='ACTIVE',startedAtSceneTime=0,stoppedAtSceneTime=nil,sceneTime=0,pollInterval=finite(config.pollInterval) and config.pollInterval>0 and config.pollInterval or DEFAULT_POLL_INTERVAL,frameLevel=config.frameLevel==true,accumulator=0,actors=actors,actorsByObjectId=byId,events={},byPair={},nextEventId=0,rawObservationCount=0,duplicateObservationCount=0,ignoredUnknownObjectCount=0,unpairedCrashSignalCount=0,droppedCollisionEventCount=0,invalidFieldCount=0,liveStateReadCount=0,liveStateReadFailureCount=0,telemetryFallbackCount=0,partialStateCount=0,diagnostics=config.diagnostics,objectProvider=config.objectProvider,liveStateReader=config.liveStateReader,controllerStateProvider=config.controllerStateProvider,sourceAdapter=config.sourceAdapter,sourceStatus={objectCollisionsAvailable=nil,crashDetectionAvailable=false,primarySource='objectCollisions'}}
+  current={sessionId=tostring(config.sessionId or ''),scenarioId=config.scenarioId,seed=config.seed,status='ACTIVE',startedAtSceneTime=0,stoppedAtSceneTime=nil,sceneTime=0,pollInterval=finite(config.pollInterval) and config.pollInterval>0 and config.pollInterval or DEFAULT_POLL_INTERVAL,frameLevel=config.frameLevel==true,accumulator=0,actors=actors,actorsByObjectId=byId,events={},byPair={},nextEventId=0,rawObservationCount=0,duplicateObservationCount=0,ignoredUnknownObjectCount=0,unpairedCrashSignalCount=0,droppedCollisionEventCount=0,invalidFieldCount=0,liveStateReadCount=0,liveStateReadFailureCount=0,telemetryFallbackCount=0,partialStateCount=0,liveObjectLookupCount=0,liveObjectNotFoundCount=0,liveObjectLookupErrorCount=0,livePositionReadCount=0,livePositionReadFailureCount=0,liveVelocityReadCount=0,liveVelocityReadFailureCount=0,liveForwardReadCount=0,liveForwardReadFailureCount=0,liveVectorSanitizeFailureCount=0,lastLiveReadFailureStage=nil,lastLiveReadFailureMessage=nil,lastLiveReadFailureObjectId=nil,lastLiveReadFailureActor=nil,lastLiveReadFailureSceneTime=nil,loggedFailureStages={},diagnostics=config.diagnostics,objectProvider=config.objectProvider,controllerStateProvider=config.controllerStateProvider,sourceAdapter=config.sourceAdapter,sourceStatus={objectCollisionsAvailable=nil,crashDetectionAvailable=false,primarySource='objectCollisions'}}
   emit(current,'INFO','collision_observer_started','Collision observer started',{sessionId=current.sessionId,actorCount=#actors,pollInterval=current.pollInterval}); return current.sessionId
 end
 function M.update(dtSim, telemetry)
