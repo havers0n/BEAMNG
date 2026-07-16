@@ -7,6 +7,7 @@ local M = {}
 local logTag = 'randomIncidents'
 local diagnostics = require('lua/ge/extensions/randomIncidents/diagnostics')
 local runtimeTelemetry = require('lua/ge/extensions/randomIncidents/runtimeTelemetry')
+local collisionObserver = require('lua/ge/extensions/randomIncidents/collisionObserver')
 local telemetryExport = require('lua/ge/extensions/randomIncidents/telemetryExport')
 local runtimeTelemetryAutoExport = true
 local runtimeTelemetryExportCount = 0
@@ -64,8 +65,9 @@ local function startRuntimeTelemetryForGeneratedScene()
       ambient = entry.isAmbient == true,
     })
   end
-  return runtimeTelemetry.startSession({
-    sessionId = diagnostics.getCurrentSessionId(),
+  local sessionId = diagnostics.getCurrentSessionId()
+  runtimeTelemetry.startSession({
+    sessionId = sessionId,
     scenarioId = generatedScene.scenarioId,
     seed = generatedScene.seed,
     actors = actors,
@@ -77,15 +79,43 @@ local function startRuntimeTelemetryForGeneratedScene()
       return nil
     end,
   })
+  collisionObserver.startSession({
+    sessionId = sessionId,
+    scenarioId = generatedScene.scenarioId,
+    seed = generatedScene.seed,
+    actors = actors,
+    diagnostics = diagnostics,
+    -- map.objectCollisions is a current-contact flag updated from vehicle
+    -- data. Observe it per frame so a short physical touch is not missed.
+    frameLevel = true,
+    controllerStateProvider = function(label)
+      for _, entry in ipairs(generatedVehicles) do if entry.label == label then return entry.controller and entry.controller.state or nil end end
+      return nil
+    end,
+  })
+  return sessionId
+end
+
+local function combinedRuntimeReport(telemetryReport, collisionReport)
+  if not telemetryReport then return nil end
+  collisionReport = collisionReport or collisionObserver.getReport()
+  telemetryReport.collisionEventCount = collisionReport and collisionReport.collisionEventCount or 0
+  telemetryReport.collisionEvents = collisionReport and collisionReport.events or {}
+  telemetryReport.collisionReport = collisionReport
+  return telemetryReport
 end
 
 -- Freeze before exporting.  The exporter receives only a report snapshot and
 -- never reaches into the live sampler, so clear/repeat cannot mix sessions.
 local function finalizeRuntimeTelemetry(reason, automatic)
   local report = runtimeTelemetry.getReport()
-  if not report or report.status ~= 'ACTIVE' then return nil end
-  runtimeTelemetry.stopSession(reason)
-  report = runtimeTelemetry.getReport()
+  local collisionReport = collisionObserver.getReport()
+  if (not report or report.status ~= 'ACTIVE') and (not collisionReport or collisionReport.status ~= 'ACTIVE') then return nil end
+  -- Freeze collision episodes before the telemetry snapshot/export, so a
+  -- repeat cannot discard the final contact observation.
+  if collisionReport and collisionReport.status == 'ACTIVE' then collisionObserver.stopSession(reason) end
+  if report and report.status == 'ACTIVE' then runtimeTelemetry.stopSession(reason) end
+  report = combinedRuntimeReport(runtimeTelemetry.getReport(), collisionObserver.getReport())
   if not automatic or not runtimeTelemetryAutoExport or not report or report.actorCount == 0 or report.sampleCount == 0 then return nil end
   diagnostics.log('INFO', 'telemetry', 'telemetry_export_started', 'Runtime telemetry auto-export started', {sessionId=report.sessionId, reason=reason})
   local result = telemetryExport.export(report, {exportCount=runtimeTelemetryExportCount})
@@ -1866,6 +1896,10 @@ end
 
 function M.clearGeneratedVehicles()
   finalizeRuntimeTelemetry('CLEARED', true)
+  -- The immutable export has already been produced above; no old object IDs
+  -- may survive into a respawned scene.
+  collisionObserver.clear()
+  runtimeTelemetry.clear()
   log('I', logTag, string.format('Clearing %d generated vehicles', #generatedVehicles))
   for index, entry in ipairs(generatedVehicles) do
     local vehicle = entry.vehicle or entry
@@ -3055,6 +3089,7 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
   timeline.elapsed = (timeline.elapsed or 0) + delta
   diagnostics.setSceneTime(timeline.elapsed)
   runtimeTelemetry.update(delta)
+  collisionObserver.update(delta, runtimeTelemetry.getReport)
 
   local direction = generatedScene.dir and vec3(generatedScene.dir.x, generatedScene.dir.y, generatedScene.dir.z) or nil
   updateVehicleControllers(delta, direction)
@@ -3414,16 +3449,28 @@ function M.exportCurrentSessionLog() return diagnostics.exportLastSession() end
 function M.getLastSessionReport() return diagnostics.getLastSessionReport() end
 function M.printLastSessionSummary() return diagnostics.printSummary() end
 function M.clearDiagnosticHistory() diagnostics.clearHistory(); return true end
-function M.getRuntimeTelemetryReport() return runtimeTelemetry.getReport() end
+function M.getRuntimeTelemetryReport() return combinedRuntimeReport(runtimeTelemetry.getReport()) end
+function M.getRuntimeCollisionReport() return collisionObserver.getReport() end
+function M.getRuntimeCollisionEvents() return collisionObserver.getEvents() end
+function M.printRuntimeCollisionSummary()
+  local summary = collisionObserver.getSummary()
+  if not summary then log('W', logTag, 'No runtime collision report is available'); return nil end
+  log('I', logTag, string.format('Runtime collisions session=%s events=%d active=%d ended=%d raw=%d duplicates=%d ignored=%d', tostring(summary.sessionId), summary.collisionEventCount or 0, summary.activeCollisionCount or 0, summary.endedCollisionCount or 0, summary.rawObservationCount or 0, summary.duplicateObservationCount or 0, summary.ignoredUnknownObjectCount or 0))
+  for _, event in ipairs(collisionObserver.getEvents()) do
+    log('I', logTag, string.format('Collision event=%s actors=%s/%s start=%.3f end=%s duration=%.3f observations=%d maxRelative=%s maxClosing=%s sources=objectCollisions:%s crashDetection:%s', tostring(event.eventId), tostring(event.actorA), tostring(event.actorB), event.startedAtSceneTime or 0, event.endedAtSceneTime and string.format('%.3f', event.endedAtSceneTime) or 'active', event.durationSeconds or 0, event.observationCount or 0, event.maxRelativeSpeedMps and string.format('%.3f', event.maxRelativeSpeedMps) or 'n/a', event.maxClosingSpeedMps and string.format('%.3f', event.maxClosingSpeedMps) or 'n/a', tostring(event.sources and event.sources.objectCollisions), tostring(event.sources and event.sources.crashDetection)))
+  end
+  return summary
+end
 function M.clearRuntimeTelemetry()
   finalizeRuntimeTelemetry('CLEARED', true)
+  collisionObserver.clear()
   return runtimeTelemetry.clear()
 end
 function M.stopRuntimeTelemetry(reason)
   return finalizeRuntimeTelemetry(reason or 'STOPPED', true) or {ok=true, stopped=false}
 end
 function M.exportRuntimeTelemetry()
-  local report = runtimeTelemetry.getReport()
+  local report = combinedRuntimeReport(runtimeTelemetry.getReport())
   if not report then return {ok=false, code='NO_REPORT', failedStep='get_report', message='No runtime telemetry report is available'} end
   diagnostics.log('INFO', 'telemetry', 'telemetry_export_started', 'Runtime telemetry export started', {sessionId=report.sessionId})
   local result = telemetryExport.export(report, {exportCount=runtimeTelemetryExportCount})
